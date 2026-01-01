@@ -1,12 +1,14 @@
 use alloc::{sync::Arc, vec::Vec};
+use core::{
+    mem::{MaybeUninit, transmute},
+    slice::from_raw_parts,
+};
 
 use axerrno::{AxError, AxResult};
 use linux_raw_sys::net::{SCM_RIGHTS, SOL_SOCKET, cmsghdr};
+use starry_vm::{vm_read_slice, vm_write_slice};
 
-use crate::{
-    file::{FileLike, get_file_like},
-    mm::{UserConstPtr, UserPtr},
-};
+use crate::file::{FileLike, get_file_like};
 
 pub enum CMsg {
     Rights { fds: Vec<Arc<dyn FileLike>> },
@@ -17,9 +19,16 @@ impl CMsg {
             return Err(AxError::InvalidInput);
         }
 
-        let data =
-            UserConstPtr::<u8>::from((hdr as *const cmsghdr as usize) + size_of::<cmsghdr>())
-                .get_as_slice(hdr.cmsg_len - size_of::<cmsghdr>())?;
+        let data_len = hdr.cmsg_len - size_of::<cmsghdr>();
+        let data_ptr = (hdr as *const cmsghdr as usize + size_of::<cmsghdr>()) as *const u8;
+        let mut data = Vec::with_capacity(data_len);
+        unsafe {
+            data.set_len(data_len);
+        }
+        vm_read_slice(data_ptr, unsafe {
+            transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut data)
+        })?;
+
         Ok(match (hdr.cmsg_level as u32, hdr.cmsg_type as u32) {
             (SOL_SOCKET, SCM_RIGHTS) => {
                 if data.len() % size_of::<i32>() != 0 {
@@ -44,12 +53,12 @@ impl CMsg {
 }
 
 pub struct CMsgBuilder<'a> {
-    hdr: UserPtr<cmsghdr>,
+    hdr: *mut cmsghdr,
     len: &'a mut usize,
     capacity: usize,
 }
 impl<'a> CMsgBuilder<'a> {
-    pub fn new(msg: UserPtr<cmsghdr>, len: &'a mut usize) -> Self {
+    pub fn new(msg: *mut cmsghdr, len: &'a mut usize) -> Self {
         let capacity = *len;
         *len = 0;
         Self {
@@ -70,17 +79,26 @@ impl<'a> CMsgBuilder<'a> {
             return Ok(false);
         };
 
-        let hdr = self.hdr.get_as_mut()?;
-        hdr.cmsg_level = level as _;
-        hdr.cmsg_type = ty as _;
-
-        let data = UserPtr::<u8>::from(self.hdr.address().as_usize() + size_of::<cmsghdr>())
-            .get_as_mut_slice(body_capacity)?;
-        let body_len = body(data)?;
+        let data_ptr = ((self.hdr as usize) + size_of::<cmsghdr>()) as *mut u8;
+        let mut data = Vec::with_capacity(body_capacity);
+        unsafe {
+            data.set_len(body_capacity);
+        }
+        let body_len = body(&mut data)?;
+        vm_write_slice(data_ptr, &data[..body_len])?;
 
         let cmsg_len = size_of::<cmsghdr>() + body_len;
-        hdr.cmsg_len = cmsg_len;
-        self.hdr = UserPtr::from(hdr as *const _ as usize + cmsg_len);
+        let hdr = cmsghdr {
+            cmsg_len,
+            cmsg_level: level as _,
+            cmsg_type: ty as _,
+        };
+        unsafe {
+            let hdr_bytes = from_raw_parts(&hdr as *const _ as *const u8, size_of::<cmsghdr>());
+            vm_write_slice(self.hdr as *mut u8, hdr_bytes)?;
+        }
+
+        self.hdr = (self.hdr as usize + cmsg_len) as *mut cmsghdr;
         *self.len += cmsg_len;
         Ok(true)
     }

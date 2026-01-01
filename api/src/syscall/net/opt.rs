@@ -2,10 +2,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axnet::options::{Configurable, GetSocketOption, SetSocketOption};
 use linux_raw_sys::net::socklen_t;
 
-use crate::{
-    file::{FileLike, Socket},
-    mm::{UserConstPtr, UserPtr},
-};
+use crate::file::{FileLike, Socket};
 
 const PROTO_TCP: u32 = linux_raw_sys::net::IPPROTO_TCP as u32;
 
@@ -116,25 +113,21 @@ pub fn sys_getsockopt(
     fd: i32,
     level: u32,
     optname: u32,
-    optval: UserPtr<u8>,
-    optlen: UserPtr<socklen_t>,
+    optval: *mut u8,
+    optlen: *mut socklen_t,
 ) -> AxResult<isize> {
-    let optlen = optlen.get_as_mut()?;
+    let optlen = unsafe { &mut *optlen };
     debug!(
         "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
-        fd,
-        level,
-        optname,
-        optval.address(),
-        optlen,
+        fd, level, optname, optval, optlen,
     );
 
-    fn get<'a, T: 'static>(val: UserPtr<u8>, len: &mut socklen_t) -> AxResult<&'a mut T> {
+    fn get<'a, T: 'static>(val: *mut u8, len: &mut socklen_t) -> AxResult<&'a mut T> {
         if (*len as usize) < size_of::<T>() {
             return Err(AxError::InvalidInput);
         }
         *len = size_of::<T>() as socklen_t;
-        val.cast().get_as_mut()
+        unsafe { (val.cast::<T>()).as_mut().ok_or(AxError::BadAddress) }
     }
 
     let socket = Socket::from_fd(fd)?;
@@ -157,23 +150,19 @@ pub fn sys_setsockopt(
     fd: i32,
     level: u32,
     optname: u32,
-    optval: UserConstPtr<u8>,
+    optval: *const u8,
     optlen: socklen_t,
 ) -> AxResult<isize> {
     debug!(
         "sys_setsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
-        fd,
-        level,
-        optname,
-        optval.address(),
-        optlen
+        fd, level, optname, optval, optlen
     );
 
-    fn get<'a, T: 'static>(val: UserConstPtr<u8>, len: socklen_t) -> AxResult<&'a T> {
+    fn get<'a, T: 'static>(val: *const u8, len: socklen_t) -> AxResult<&'a T> {
         if len as usize != size_of::<T>() {
             return Err(AxError::InvalidInput);
         }
-        val.cast().get_as_ref()
+        unsafe { (val.cast::<T>()).as_ref().ok_or(AxError::BadAddress) }
     }
 
     let socket = Socket::from_fd(fd)?;
