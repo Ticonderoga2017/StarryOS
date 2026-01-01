@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     mem::{MaybeUninit, transmute},
     slice::from_raw_parts,
@@ -21,10 +21,7 @@ impl CMsg {
 
         let data_len = hdr.cmsg_len - size_of::<cmsghdr>();
         let data_ptr = (hdr as *const cmsghdr as usize + size_of::<cmsghdr>()) as *const u8;
-        let mut data = Vec::with_capacity(data_len);
-        unsafe {
-            data.set_len(data_len);
-        }
+        let mut data = vec![0u8; data_len];
         vm_read_slice(data_ptr, unsafe {
             transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut data)
         })?;
@@ -80,10 +77,7 @@ impl<'a> CMsgBuilder<'a> {
         };
 
         let data_ptr = ((self.hdr as usize) + size_of::<cmsghdr>()) as *mut u8;
-        let mut data = Vec::with_capacity(body_capacity);
-        unsafe {
-            data.set_len(body_capacity);
-        }
+        let mut data = vec![0u8; body_capacity];
         let body_len = body(&mut data)?;
         vm_write_slice(data_ptr, &data[..body_len])?;
 

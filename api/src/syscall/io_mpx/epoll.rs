@@ -103,10 +103,8 @@ fn do_epoll_wait(
             Err(_) => Ok(0),
         }
     })?;
-    for i in 0..(n as usize) {
-        unsafe {
-            events.add(i).vm_write(buf[i])?;
-        }
+    for (i, ev) in buf.iter().take(n as usize).enumerate() {
+        unsafe { events.add(i).vm_write(*ev)? };
     }
     Ok(n)
 }

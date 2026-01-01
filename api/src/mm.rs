@@ -13,11 +13,8 @@ use axhal::{
 use axio::prelude::*;
 use axtask::current;
 use memory_addr::VirtAddr;
-use starry_core::{
-    task::AsThread,
-};
+use starry_core::task::AsThread;
 use starry_vm::{vm_load_until_nul, vm_read_slice, vm_write_slice};
-
 
 #[register_trap_handler(PAGE_FAULT)]
 fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {

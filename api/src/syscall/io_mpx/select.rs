@@ -187,7 +187,7 @@ pub fn sys_select(
             .nullable()
             .map(|p| unsafe { p.vm_read_uninit()?.assume_init().try_into_time_value() })
             .transpose()?,
-        ptr::null(),
+        core::ptr::null(),
     )
 }
 

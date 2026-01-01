@@ -1,7 +1,7 @@
 //! Wrapper for [`sockaddr`]. Using trait to convert between [`SocketAddr`] and
 //! [`sockaddr`] types.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::{
     mem::{MaybeUninit, size_of, transmute},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -151,8 +151,7 @@ impl SocketAddrExt for UnixSocketAddr {
         let offset = size_of::<__kernel_sa_family_t>();
         let base = addr.cast::<u8>().wrapping_add(offset);
         let len = addrlen as usize - offset;
-        let mut data = Vec::with_capacity(len);
-        unsafe { data.set_len(len) }
+        let mut data = vec![0u8; len];
         vm_read_slice(base, unsafe {
             transmute::<&mut [u8], &mut [MaybeUninit<u8>]>(&mut data)
         })?;
