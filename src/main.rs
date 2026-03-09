@@ -20,7 +20,8 @@ pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 fn main() {
     starry_api::init();
 
-    // #[cfg(feature = "sg2002")]
+    #[cfg(feature = "sg2002")]
+    sdio1_probe();
     // {
     //     // wireless 完整初始化：aicbsp_init → aicbsp_set_subsys(Wifi, On) → FDRV platform_init
     //     let mut bsp_info = wireless::bsp::AicBspInfo::default();
@@ -56,3 +57,40 @@ extern crate axplat_riscv64_visionfive2;
 
 #[cfg(feature = "sg2002")]
 extern crate axplat_riscv64_sg2002;
+
+#[cfg(feature = "sg2002")]
+fn sdio1_probe() {
+    use sdhci_cv1800::CviSdhci;  
+    use aic8800_sdio::SdioHost;  
+  
+   // 修正: SD1 主系统总线地址 (非 RTC 域)  
+    // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
+    // Linux DTS: wifi-sd@4320000  
+    const SDIO1_PADDR: usize = 0x0432_0000;  
+    const SDIO1_VADDR: usize = SDIO1_PADDR + 0xFFFF_FFC0_0000_0000; 
+  
+    info!("========== SDIO1 Probe Start ==========");  
+  
+    let mut sdio1 = CviSdhci::new(SDIO1_VADDR);  
+  
+    match sdio1.init() {  
+        Ok(()) => {  
+            let (vid, did) = sdio1.vendor_device_id();  
+            info!("SDIO1 probe OK: vendor=0x{:04x}, device=0x{:04x}", vid, did);  
+            match (vid, did) {  
+                (0x5449, 0x0145) => info!("Detected: AIC8801"),  
+                (0xc8a1, 0xc08d) => info!("Detected: AIC8800DC"),  
+                (0xc8a1, 0x0082) => info!("Detected: AIC8800D80"),  
+                (0xc8a1, 0x2082) => info!("Detected: AIC8800D80X2"),  
+                _ => warn!("Unknown SDIO device: vid=0x{:04x} did=0x{:04x}", vid, did),  
+            }  
+        }  
+        Err(e) => {  
+            error!("SDIO1 init failed: {:?}", e);  
+            error!(">>> Check clock/reset/pinmux — dumping registers <<<");  
+            sdhci_cv1800::hw_init::sdio1_hw_dump();  
+        }  
+    }  
+  
+    info!("========== SDIO1 Probe End =========="); 
+}

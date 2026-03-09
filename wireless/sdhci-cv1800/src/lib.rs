@@ -1,10 +1,11 @@
 #![no_std]
 
 mod regs;
+pub mod hw_init;
 
 use core::ptr::{read_volatile, write_volatile};
 use aic8800_sdio::{SdioHost, cccr::*, cmd::*, error::SdioError};
-use crate::regs::*;
+use crate::{hw_init::sdio1_hw_init, regs::*};
 
 /// CVI SoC WiFi SDIO 控制器  
 pub struct CviSdhci {  
@@ -111,7 +112,7 @@ impl CviSdhci {
         let cmd_reg = match cmd_idx {  
             0 => (0u16 << 8) | 0x00,           // CMD0: 无响应  
             3 => (3u16 << 8) | 0x1A,           // CMD3: R6  
-            5 => (5u16 << 8) | 0x1A,           // CMD5: R4  
+            5 => (5u16 << 8) | 0x02,           // CMD5: R4  
             7 => (7u16 << 8) | 0x1B,           // CMD7: R1b  
             52 => (52u16 << 8) | 0x1A,         // CMD52: R5  
             53 => (53u16 << 8) | 0x3A,         // CMD53: R5 + data  
@@ -595,9 +596,26 @@ impl CviSdhci {
 
 impl SdioHost for CviSdhci {
     fn init(&mut self) -> Result<(), SdioError> {
+        // ---- SDIO1 SoC 级硬件初始化 ---- 
+        // 仅当 base 为 SDIO1 地址时执行 (SDIO0 不需要)  
+        const SDIO1_VADDR: usize = 0x0432_0000 + 0xffff_ffc0_0000_0000;
+        if self.base == SDIO1_VADDR {
+            sdio1_hw_init();
+        }
+
         // 1. 软件复位 (Reset All: CMD + DAT + 全部逻辑)  
         self.write8(SDHCI_SOFTWARE_RESET, SWRST_ALL);
         self.wait_reset_complete()?;
+
+        // ---- SDHCI 标准卡检测覆写 ----  
+        // WiFi 模块无物理 CD 引脚, 通过 HOST_CTL1 强制 CARD_INSERTED  
+        // bit7: CARD_DET_SEL = 1 (使用 CARD_DET_TEST 而非 SD_CD 引脚)  
+        // bit6: CARD_DET_TEST = 1 (卡已插入)  
+        if self.base == SDIO1_VADDR {
+            let hc1 = self.read8(SDHCI_HOST_CONTROL);
+            self.write8(SDHCI_HOST_CONTROL, hc1 | 0xc0); // bit7 + bit6
+            log::debug!("SDHCI: Forced card detect via HOST_CTL1"); 
+        }
 
         // 2. 供电 3.3V (必须在启动时钟之前)  
         self.write8(SDHCI_POWER_CONTROL, POWER_330V_ON);
