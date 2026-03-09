@@ -1,0 +1,9 @@
+[package]
+name = "sdhci-cv1800"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+aic8800_sdio = { path = "../aic8800_sdio" }
+log = "0.4"  

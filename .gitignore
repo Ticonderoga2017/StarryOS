@@ -13,5 +13,6 @@
 /mnt
 *.swp
 *.swo
+Cargo.lock
 
 /rootfs/tmp/mnt_rootfs
