@@ -137,12 +137,13 @@ features = ["fp-simd", "irq", "rtc"]
 optional = true
 
 [dependencies.axplat-riscv64-sg2002]
-version = "0.1"
-git = "https://github.com/pengzechen/axplat-riscv64-sg2002.git"
-rev = "a4c6672"
+path = "../axplat-riscv64-sg2002"
 features = ["fp-simd", "irq", "rtc"]
 optional = true
 
 [package.metadata.vendor-filter]
 platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
 all-features = true
+
+[patch.crates-io]
+page_table_entry = { git = "https://github.com/pengzechen/page_table_multiarch.git", rev = "5aabe07831b586904632abe44cdfc6ee6f3e5b44" }
