@@ -58,40 +58,11 @@ extern crate axplat_riscv64_visionfive2;
 #[cfg(feature = "sg2002")]
 extern crate axplat_riscv64_sg2002;
 
-
-// ============================================================  
-// 固件数据 (编译时嵌入)  
-//  
-// 将对应芯片的固件文件放入 StarryOS/firmware/ 目录:  
-//   - fmacfw.bin          (AIC8801 主固件)  
-//   - fw_patch.bin         (AIC8801 补丁, 可选)  
-//   - fmacfw_patch_8800dc.bin (AIC8800DC 补丁)  
-//   - fmacfw_8800d80.bin   (AIC8800D80 主固件)  
-//  
-// 当前默认嵌入 AIC8800DC 的补丁固件 (LicheeRV Nano 板载芯片)  
-// 如果你的板卡芯片型号不同, 需替换对应的文件名  
-// ============================================================  
-#[cfg(feature = "sg2002")]  
-mod firmware_data {  
-    // AIC8800DC 补丁固件 (LicheeRV Nano 默认使用 AIC8800DC)  
-    // pub static WL_FW: &[u8] = &[];  // DC 无需主固件 (使用芯片 ROM)  
-    // pub static WL_PATCH: &[u8] = include_bytes!("../firmware/fmacfw_patch_8800dc.bin");  
-  
-    // 如果板卡使用 AIC8801, 替换为:  
-    pub static WL_FW: &[u8] = include_bytes!("../wireless/firmware/fmacfw.bin");  
-    pub static WL_PATCH: &[u8] = include_bytes!("../wireless/firmware/fw_patch.bin");  
-  
-    // 如果板卡使用 AIC8800D80, 替换为:  
-    // pub static WL_FW: &[u8] = include_bytes!("../firmware/fmacfw_8800d80.bin");  
-    // pub static WL_PATCH: &[u8] = &[];  
-}  
-
 #[cfg(feature = "sg2002")]
 fn sdio1_probe() {
     use sdhci_cv1800::{CviSdhci, hw_init};  
     use aic8800_sdio::SdioHost;  
-    use aic8800::chip_id::ChipVariant;  
-    use aic8800::fw_select::FirmwareSet;  
+    use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
   
    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
@@ -116,7 +87,7 @@ fn sdio1_probe() {
                 return;  
             }  
   
-            match aic8800::firmware_init(&mut sdio1, chip) {  
+            match aic8800_fw::firmware_init(&mut sdio1, chip) {  
                 Ok(()) => info!("AIC8800 firmware init SUCCESS"),  
                 Err(e) => error!("AIC8800 firmware init FAILED: {:?}", e),  
             } 

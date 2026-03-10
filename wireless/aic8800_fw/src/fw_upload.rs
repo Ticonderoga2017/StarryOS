@@ -1,24 +1,16 @@
 //! 固件上传核心逻辑 
 
 use aic8800_sdio::{SdioHost, error::SdioError};  
+use crate::fw_data::FirmwareSet;
 use crate::chip_id::*;  
-use crate::ipc_msg::{self, IpcTransport, ipc_mem_block_write, ipc_start_app, ipc_mem_read};  
-use crate::fw_select::FirmwareSet;
-
-/// 固件上传块大小 (与 Linux 驱动一致)  
-const FW_UPLOAD_CHUNK_SIZE: usize = 1024;  
-
-/// 芯片信息寄存器地址 (所有 AIC 芯片通用)  
-const CHIP_INFO_ADDR: u32 = 0x40500000;  
-  
-/// start_app boot type 定义  
-const HOST_START_APP_AUTO: u32 = 1;  
-// const HOST_START_APP_CUSTOM: u32 = 2;  
-// const HOST_START_APP_FNCALL: u32 = 4;  
-const HOST_START_APP_DUMMY: u32 = 5;  
+use crate::ipc_msg::{IpcTransport, ipc_mem_block_write, ipc_start_app};  
 
 /// 将固件二进制数据上传到芯片 RAM  
-pub fn upload_firmware<H: SdioHost>(transport: &mut IpcTransport<H>, fw_data: &[u8], fw_addr: u32) -> Result<(), SdioError> {  
+pub fn upload_firmware<H: SdioHost>(
+    transport: &mut IpcTransport<H>, 
+    fw_data: &[u8], 
+    fw_addr: u32
+) -> Result<(), SdioError> {  
     let size = fw_data.len();
     log::info!("[aic8800] Uploading firmware: addr=0x{:08x}, size={} bytes", fw_addr, size);  
     if size == 0 {
@@ -44,18 +36,6 @@ pub fn upload_firmware<H: SdioHost>(transport: &mut IpcTransport<H>, fw_data: &[
     log::info!("[aic8800] Firmware upload complete ({} bytes)", size); 
     Ok(())
 }
-
-// /// 读取芯片版本信息  
-// /// 返回 (chip_rev, raw_data)  
-// pub fn read_chip_revision<H: SdioHost>(transport: &mut IpcTransport<H>) -> Result<(u8, u32), SdioError> {  
-//     let raw_data = ipc_mem_read(transport, CHIP_INFO_ADDR)?;  
-//     let chip_rev =((raw_data >> 16) & 0x3F) as u8; 
-//     log::info!(  
-//         "[aic8800] Chip info @0x40500000 = 0x{:08x}, rev = {}",  
-//         raw_data, chip_rev  
-//     ); 
-//     Ok((chip_rev, raw_data)) // 返回原始数据的字节数组
-// }
 
 /// AIC8801 固件初始化流程  
 pub fn init_aic8801_firmware<H: SdioHost>(
@@ -107,12 +87,27 @@ pub fn init_aic8800dc_firmware<H: SdioHost>(
     //   配置 PMIC 电压, BBPLL, 时钟等  
     //   需要实现 DBG_MEM_MASK_WRITE_REQ  
 
-    // 1. 上传补丁固件到 ROM_FMAC_PATCH_ADDR  
-    if !fw_set.wl_patch.is_empty() {  
+    // U01: 上传完整固件到 RAM; U02+: 补丁上传到 ROM_FMAC_PATCH_ADDR  
+    let upload_addr = if chip_rev.rev == CHIP_REV_U01 {
+        RAM_FMAC_FW_ADDR
+    } else {
+        ROM_FMAC_FW_ADDR
+    };
+    upload_firmware(transport, fw_set.wl_fw, upload_addr)?;
+
+    // U01 还需要上传补丁  
+    if chip_rev.rev == CHIP_REV_U01 && !fw_set.wl_patch.is_empty() {  
         upload_firmware(transport, fw_set.wl_patch, ROM_FMAC_PATCH_ADDR)?;  
-    } else {  
-        log::warn!("[aic8800] No patch firmware for DC, skipping patch upload");  
-    }  
+    }
+
+    // TODO: aicwf_patch_config_8800dc (LDPC/AGC/TxGain/JumpTable)  
+
+    // // 1. 上传补丁固件到 ROM_FMAC_PATCH_ADDR  
+    // if !fw_set.wl_patch.is_empty() {  
+    //     upload_firmware(transport, fw_set.wl_patch, ROM_FMAC_PATCH_ADDR)?;  
+    // } else {  
+    //     log::warn!("[aic8800] No patch firmware for DC, skipping patch upload");  
+    // }  
 
     // TODO Phase 1c: aicwf_patch_config_8800dc(transport, chip_rev)?;  
     //   LDPC/AGC/TxGain/跳转表 配置  
@@ -135,9 +130,14 @@ pub fn init_aic8800dc_firmware<H: SdioHost>(
     // TODO: patch_config_8800dc(transport, chip_rev)?;  
   
     // 5. 启动固件  
+    let boot_addr = if chip_rev.rev == CHIP_REV_U01 {
+        RAM_FMAC_FW_ADDR  
+    } else {  
+        ROM_FMAC_FW_ADDR  
+    }; 
     let status = ipc_start_app(  
         transport,  
-        RAM_FMAC_FW_ADDR,       // bootaddr = 0x00120000  
+        boot_addr,      
         HOST_START_APP_DUMMY,    // boottype = 5 (AIC8800DC normal mode)  
     )?; 
     log::info!("[aic8800] start_app status = 0x{:08x}", status);     

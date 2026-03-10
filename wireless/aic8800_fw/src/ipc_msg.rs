@@ -10,12 +10,70 @@ use crate::chip_id::*;
 // LMAC 消息 ID 定义  
 // ============================================================  
 const TASK_DBG: u16 = 1;  
-const LMAC_FIRST_MSG_SHIFT: u16 = 10;  
 const DRV_TASK_ID: u16 = 100;  
-  
-fn lmac_first_msg(task: u16) -> u16 {  
-    task << LMAC_FIRST_MSG_SHIFT  
+const LMAC_FIRST_DBG: u16 = 0x0400; // TASK_DBG(1) << 10   
+
+/// Debug 消息 ID  
+#[repr(u16)]  
+#[derive(Debug, Clone, Copy)]  
+pub enum DbgMsgId {  
+    MemReadReq,          // 0x0400  
+    MemReadCfm,          // 0x0401  
+    MemWriteReq,         // 0x0402  
+    MemWriteCfm,         // 0x0403  
+    SetModFilterReq,     // 0x0404  
+    SetModFilterCfm,     // 0x0405  
+    SetSevFilterReq,     // 0x0406  
+    SetSevFilterCfm,     // 0x0407  
+    ErrorInd,            // 0x0408    
+    GetSysStatReq,       // 0x0409  
+    GetSysStatCfm,       // 0x040a  
+    MemBlockWriteReq,    // 0x040b  
+    MemBlockWriteCfm,    // 0x040c  
+    StartAppReq,         // 0x040d  
+    StartAppCfm,         // 0x040e  
+    StartNpcReq,         // 0x040f  
+    StartNpcCfm,         // 0x0410  
+    MemMaskWriteReq,     // 0x0411  
+    MemMaskWriteCfm,     // 0x0412  
 } 
+  
+impl DbgMsgId {  
+    pub fn msg_id(self) -> u16 {  
+        LMAC_FIRST_DBG + match self {  
+            Self::MemReadReq       => 0,  
+            Self::MemReadCfm       => 1,  
+            Self::MemWriteReq      => 2,  
+            Self::MemWriteCfm      => 3,  
+            Self::SetModFilterReq  => 4,  
+            Self::SetModFilterCfm  => 5,  
+            Self::SetSevFilterReq  => 6,  
+            Self::SetSevFilterCfm  => 7,  
+            Self::ErrorInd         => 8,    
+            Self::GetSysStatReq    => 9,  
+            Self::GetSysStatCfm    => 10,  
+            Self::MemBlockWriteReq => 11,   
+            Self::MemBlockWriteCfm => 12,  
+            Self::StartAppReq      => 13,    
+            Self::StartAppCfm      => 14,  
+            Self::StartNpcReq      => 15,  
+            Self::StartNpcCfm      => 16,  
+            Self::MemMaskWriteReq  => 17,  
+            Self::MemMaskWriteCfm  => 18,  
+        }  
+    }  
+}
+
+// ============================================================  
+// SDIO 传输类型  
+// ============================================================  
+const SDIO_TYPE_CFG_CMD_RSP: u8 = 0x11;  
+  
+// ============================================================  
+// 消息缓冲区  
+// ============================================================  
+/// 最大消息大小: 8 (transport header) + 8 (lmac_msg header) + 1032 (block write payload)  
+const MSG_BUF_MAX: usize = 1536;  
 
 /// CRC-8 with polynomial 0x107 (X^8 + X^2 + X + 1)  
 /// Used by AIC8800D80/D80X2 for SDIO transport header CRC  
@@ -37,38 +95,6 @@ fn crc8_ponl_107(data: &[u8]) -> u8 {
     }  
     crc  
 }
-
-/// Debug 消息 ID  
-#[repr(u16)]  
-#[derive(Debug, Clone, Copy)]  
-pub enum DbgMsgId {  
-    MemReadReq = 0,  
-    MemReadCfm = 1,  
-    MemWriteReq = 2,  
-    MemWriteCfm = 3,  
-    // ...省略中间不需要的...  
-    MemBlockWriteReq = 10,  
-    MemBlockWriteCfm = 11,  
-    StartAppReq = 12,  
-    StartAppCfm = 13,  
-}  
-  
-impl DbgMsgId {  
-    pub fn msg_id(self) -> u16 {  
-        lmac_first_msg(TASK_DBG) + (self as u16)  
-    }  
-}  
-
-// ============================================================  
-// SDIO 传输类型  
-// ============================================================  
-const SDIO_TYPE_CFG_CMD_RSP: u8 = 0x11;  
-  
-// ============================================================  
-// 消息缓冲区  
-// ============================================================  
-/// 最大消息大小: 8 (transport header) + 8 (lmac_msg header) + 1032 (block write payload)  
-const MSG_BUF_MAX: usize = 1536;  
 
 /// IPC 消息传输层  
 ///  
@@ -196,7 +222,10 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
                 self.sdio_host.read_fifo(1, SDIOWIFI_RD_FIFO_ADDR, &mut self.rx_buf[..read_len])?;
                 
                 // 验证响应 msg_id (CFM = REQ + 1)  
-                let resp_id = u16::from_le_bytes([self.rx_buf[8], self.rx_buf[9]]); // lmac_msg header 中的 msg_id 位于 offset 8-9
+                let resp_id = u16::from_le_bytes([
+                    self.rx_buf[4], 
+                    self.rx_buf[5]
+                    ]); // lmac_msg header 中的 msg_id 位于 offset 8-9
                 if resp_id != id + 1 {
                     log::error!("IPC: unexpected response id=0x{:04x}, expected=0x{:04x}", resp_id, id + 1);
                     return Err(SdioError::CrcError); 
@@ -212,14 +241,27 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
             } else {
                 retry += 1;
             }        
-            if retry > 5_000 {
-                log::error!("IPC: response timeout for msg_id=0x{:04x}", id); 
-                return Err(SdioError::Timeout); // 超时错误
+            
+            // if retry > 5_000 {
+            //     log::error!("IPC: response timeout for msg_id=0x{:04x}", id); 
+            //     return Err(SdioError::Timeout); // 超时错误
+            // }
+            // // 简单忙等 (no_std 环境下没有 sleep)  
+            // for _ in 0..1000 {  
+            //     core::hint::spin_loop();  
+            // }      
+            let delay_loops = if retry < 1_000 {  
+                5_000   // 前 1000 次: ~10μs/次, 总计 ~10ms  
+            } else if retry < 5_000 {  
+                50_000  // 中间 4000 次: ~100μs/次, 总计 ~400ms  
+            } else {  
+                500_000 // 后续: ~1ms/次  
+            };  
+            for _ in 0..delay_loops { core::hint::spin_loop(); }  
+            if retry > 20_000 { // 总计约 15 秒  
+                log::error!("IPC: response timeout for msg_id=0x{:04x}", id);  
+                return Err(SdioError::Timeout);  
             }
-            // 简单忙等 (no_std 环境下没有 sleep)  
-            for _ in 0..1000 {  
-                core::hint::spin_loop();  
-            }      
         }        
     }
 }
@@ -249,7 +291,10 @@ pub fn ipc_mem_write<H: SdioHost>(transport: &mut IpcTransport<H>, addr: u32, da
 }
 
 /// 块写入芯片内存 (最大 1032 字节)
-pub fn ipc_mem_block_write<H: SdioHost>(transport: &mut IpcTransport<H>, addr: u32, data: &[u8]) -> Result<(), SdioError> {  
+pub fn ipc_mem_block_write<H: SdioHost>(
+    transport: &mut IpcTransport<H>,
+     addr: u32, data: &[u8]
+    ) -> Result<(), SdioError> {  
     assert!(data.len() <= 1024, "block write max 1024 bytes");
     // param: memaddr (4) + memsize (4) + memdata[256] (up to 1024 bytes)  
     let payload_len = 4 + 4 + data.len(); // 地址 + 大小 + 数据
@@ -259,7 +304,11 @@ pub fn ipc_mem_block_write<H: SdioHost>(transport: &mut IpcTransport<H>, addr: u
     payload[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes()); // 后 4 字节为大小
     payload[8..8 + data.len()].copy_from_slice(data); // 后续字节为数据
     let mut cfm = [0u8; 4];
-    transport.send_msg(DbgMsgId::MemBlockWriteReq, &payload[..payload_len], true, &mut cfm)?;
+    transport.send_msg(
+        DbgMsgId::MemBlockWriteReq,
+         &payload[..payload_len], 
+         true, 
+         &mut cfm)?;
     Ok(())
 }
 
