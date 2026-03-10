@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["api", "core", "wireless/*"]
+members = ["api", "core",]
 exclude = ["arceos"]
 
 [workspace.package]
@@ -112,6 +112,7 @@ sg2002 = [
     "dep:axplat-riscv64-sg2002",
     "dep:sdhci-cv1800",
     "dep:aic8800_sdio",
+    "dep:aic8800", 
     "axfeat/driver-ramdisk"]
 
 [dependencies]
@@ -151,6 +152,10 @@ optional = true
   
 [dependencies.aic8800_sdio]  
 path = "wireless/aic8800_sdio"  
+optional = true  
+
+[dependencies.aic8800]  
+path = "wireless/aic8800"  
 optional = true  
 
 [package.metadata.vendor-filter]
