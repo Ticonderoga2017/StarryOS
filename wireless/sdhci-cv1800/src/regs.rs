@@ -16,6 +16,7 @@ pub const SDHCI_POWER_CONTROL:   u32 = 0x29;
 pub const SDHCI_CLOCK_CONTROL:   u32 = 0x2C;  
 pub const SDHCI_TIMEOUT_CONTROL: u32 = 0x2E;  
 pub const SDHCI_SOFTWARE_RESET:  u32 = 0x2F;  
+pub const SOFTWARE_RESET_DAT:    u8  = 0x04;
   
 // ---- 中断寄存器 (全部 16-bit 分离访问) ----  
 pub const SDHCI_INT_STATUS_NORM: u32 = 0x30;  // Normal Interrupt Status  

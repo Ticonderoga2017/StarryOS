@@ -421,10 +421,39 @@ impl CviSdhci {
             let norm_status = self.read16(SDHCI_INT_STATUS_NORM);  
             if norm_status & NORM_INT_ERROR != 0 {  
                 let err = self.read16(SDHCI_INT_STATUS_ERR);
+
+                // 1. 清除错误状态 (W1C)  
                 self.write16(SDHCI_INT_STATUS_ERR, err); // 清除错误状态位
                 self.write16(SDHCI_INT_STATUS_NORM, NORM_INT_ERROR); // 清除错误汇总位;
                 log::error!("PIO read error: norm_status=0x{:04x}, err_status=0x{:04x}", norm_status, err);
-                return Err(SdioError::IoError);
+                
+                // 2. 软件复位 DAT 线 (SDHCI spec: offset 0x2F, bit 2)  
+                self.write8(SDHCI_SOFTWARE_RESET, SOFTWARE_RESET_DAT);
+                // 等待复位完成 (bit 自动清零)  
+                let mut reset_timeout = 100_000u32;
+                while self.read8(SDHCI_SOFTWARE_RESET) & SOFTWARE_RESET_DAT != 0 {
+                    reset_timeout -= 1;
+                    if reset_timeout == 0 {
+                        log::error!("SDHCI: DAT line reset timeout");  
+                        break;  
+                    }
+                    core::hint::spin_loop();
+                }
+                log::warn!("SDHCI: DAT line reset done");  
+  
+                return Err(SdioError::IoError);  
+                // // 2. 清除 Error Interrupt Status (offset 0x32)  
+                // //    写 0xFFFF 清除所有错误位  
+                // let err_int_reg = base + 0x32;  
+                // unsafe { core::ptr::write_volatile(err_int_reg as *mut u16, 0xFFFF); }  
+                
+                // // 3. 清除 Normal Interrupt Status 的 Error Interrupt 位 (offset 0x30, bit 15)  
+                // let norm_int_reg = base + 0x30;  
+                // unsafe { core::ptr::write_volatile(norm_int_reg as *mut u16, 0x8000); }  
+                
+                // log::warn!("SDHCI: DAT line reset and error status cleared");  
+                
+                // return Err(SdioError::IoError);
             }  
             // 检查 Buffer Read Ready (bit 5)
             if norm_status & NORM_INT_BUF_RD_READY != 0 {  

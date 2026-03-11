@@ -210,6 +210,7 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
         // 轮询等待响应  
         // 读取 BLOCK_CNT_REG 等待非零值 (表示有数据可读)  
         let mut retry = 0u32;
+        let mut read_err_cnt = 0u32; //read_fifo 错误重试计数器
         loop {
             let raw_cnt = self.sdio_host.read_byte(1, SDIOWIFI_BLOCK_CNT_REG)?;
             // mask 掉 SDIO_OTHER_INTERRUPT (bit7)  
@@ -219,25 +220,47 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
             } else if raw_cnt > 0 {
                 let block_cnt = raw_cnt as usize;
                 let read_len = (block_cnt * 512).min(MSG_BUF_MAX);  
-                self.sdio_host.read_fifo(1, SDIOWIFI_RD_FIFO_ADDR, &mut self.rx_buf[..read_len])?;
-                
-                // 验证响应 msg_id (CFM = REQ + 1)  
-                let resp_id = u16::from_le_bytes([
-                    self.rx_buf[4], 
-                    self.rx_buf[5]
-                    ]); // lmac_msg header 中的 msg_id 位于 offset 8-9
-                if resp_id != id + 1 {
-                    log::error!("IPC: unexpected response id=0x{:04x}, expected=0x{:04x}", resp_id, id + 1);
-                    return Err(SdioError::CrcError); 
-                }
-
-                // 解析响应: 跳过 transport header (4) + dummy (4) + lmac_msg header (8)
-                let payload_offset = 16;
-                let cfm_len = cfm_buf.len().min(read_len.saturating_sub(payload_offset));
-                if cfm_len > 0 {
-                    cfm_buf[..cfm_len].copy_from_slice(&self.rx_buf[payload_offset..payload_offset + cfm_len]);
-                    return Ok(cfm_len); // 返回响应长度
-                }
+                match self.sdio_host.read_fifo(
+                    1, 
+                    SDIOWIFI_RD_FIFO_ADDR,
+                    &mut self.rx_buf[..read_len],
+                ) {
+                    Ok(()) => {
+                        // 验证响应 msg_id (CFM = REQ + 1)  
+                        let resp_id = u16::from_le_bytes([
+                            self.rx_buf[4], 
+                            self.rx_buf[5]
+                        ]); // lmac_msg header 中的 msg_id 位于 offset 8-9
+                        if resp_id != id + 1 {
+                            log::error!("IPC: unexpected response id=0x{:04x}, expected=0x{:04x}", resp_id, id + 1);
+                            return Err(SdioError::CrcError); 
+                        }
+                        // 解析响应: 跳过 transport header (4) + dummy (4) + lmac_msg header (8)
+                        let payload_offset = 16;
+                        let cfm_len = cfm_buf.len().min(read_len.saturating_sub(payload_offset));
+                        if cfm_len > 0 {
+                            cfm_buf[..cfm_len].copy_from_slice(&self.rx_buf[payload_offset..payload_offset + cfm_len]);                                
+                        }
+                        return Ok(cfm_len); // 返回响应长度
+                    }
+                    Err(e) => {
+                        // CRC Error / IoError 时不立即退出，重试  
+                        read_err_cnt += 1;
+                        log::warn!(  
+                            "IPC: read_fifo error ({}/5) for msg_id=0x{:04x}: {:?}",  
+                            read_err_cnt, id, e  
+                        ); 
+                        if read_err_cnt > 5 {
+                            log::error!("IPC: too many read errors for msg_id=0x{:04x}", id);  
+                            return Err(e); 
+                        }
+                        // 等待芯片 SDIO 接口稳定 (DAT 线已在 sdhci 层复位)  
+                        for _ in 0..500_000 {  
+                            core::hint::spin_loop();  
+                        }  
+                        continue; // 回到轮询 block_cnt_reg 
+                    }
+                }        
             } else {
                 retry += 1;
             }        
