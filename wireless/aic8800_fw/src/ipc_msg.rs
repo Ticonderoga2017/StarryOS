@@ -242,26 +242,14 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
                 retry += 1;
             }        
             
-            // if retry > 5_000 {
-            //     log::error!("IPC: response timeout for msg_id=0x{:04x}", id); 
-            //     return Err(SdioError::Timeout); // 超时错误
-            // }
-            // // 简单忙等 (no_std 环境下没有 sleep)  
-            // for _ in 0..1000 {  
-            //     core::hint::spin_loop();  
-            // }      
-            let delay_loops = if retry < 1_000 {  
-                5_000   // 前 1000 次: ~10μs/次, 总计 ~10ms  
-            } else if retry < 5_000 {  
-                50_000  // 中间 4000 次: ~100μs/次, 总计 ~400ms  
-            } else {  
-                500_000 // 后续: ~1ms/次  
-            };  
-            for _ in 0..delay_loops { core::hint::spin_loop(); }  
-            if retry > 20_000 { // 总计约 15 秒  
-                log::error!("IPC: response timeout for msg_id=0x{:04x}", id);  
-                return Err(SdioError::Timeout);  
+            if retry > 5_000 {
+                log::error!("IPC: response timeout for msg_id=0x{:04x}", id); 
+                return Err(SdioError::Timeout); // 超时错误
             }
+            // 简单忙等 (no_std 环境下没有 sleep)  
+            for _ in 0..1000 {  
+                core::hint::spin_loop();  
+            }      
         }        
     }
 }
@@ -309,6 +297,24 @@ pub fn ipc_mem_block_write<H: SdioHost>(
          &payload[..payload_len], 
          true, 
          &mut cfm)?;
+    Ok(())
+}
+
+/// 掩码写入芯片内存 (DBG_MEM_MASK_WRITE_REQ = 0x0411)
+pub fn ipc_mem_mask_write<H: SdioHost> (
+    transport: &mut IpcTransport<H>,
+    addr: u32,
+    mask: u32,
+    data: u32,
+) -> Result<(), SdioError> {
+    // param: memaddr(4) + memmask(4) + memdata(4) = 12 bytes
+    let mut payload = [0u8; 12];
+    payload[0..4].copy_from_slice(&addr.to_le_bytes());
+    payload[4..8].copy_from_slice(&mask.to_le_bytes());
+    payload[8..12].copy_from_slice(&data.to_le_bytes());
+    // cfm: memaddr(4) + memdata(4) = 8 bytes
+    let mut cfm = [0u8; 8];
+    transport.send_msg(DbgMsgId::MemMaskWriteReq, &payload, true, &mut cfm)?;
     Ok(())
 }
 

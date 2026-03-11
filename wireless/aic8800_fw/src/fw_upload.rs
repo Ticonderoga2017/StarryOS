@@ -3,7 +3,7 @@
 use aic8800_sdio::{SdioHost, error::SdioError};  
 use crate::fw_data::FirmwareSet;
 use crate::chip_id::*;  
-use crate::ipc_msg::{IpcTransport, ipc_mem_block_write, ipc_start_app};  
+use crate::ipc_msg::{IpcTransport, ipc_mem_block_write, ipc_mem_mask_write, ipc_mem_read, ipc_mem_write, ipc_start_app};  
 
 /// 将固件二进制数据上传到芯片 RAM  
 pub fn upload_firmware<H: SdioHost>(
@@ -37,7 +37,68 @@ pub fn upload_firmware<H: SdioHost>(
     Ok(())
 }
 
+/// AIC8801 Patch 表配置
+/// 流程:
+///   1. 从 RAM_FMAC_FW_ADDR + 0x180 读取 config_base
+///   2. 将 patch 地址和数量写入对应寄存器
+///   3. 将 patch_tbl 条目写入 RAM
+pub fn aicwifi_patch_config<H: SdioHost> (
+    transport: &mut IpcTransport<H>
+) -> Result<(), SdioError> {
+    log::info!("[aic8800] === aicwifi_patch_config start ===");   
+
+    let patch_num: u32 = (PATCH_TBL.len() as u32) * 2; // 每条目 2 个 u32
+    let start_addr: u32 = PATCH_TBL_START_ADDR;        // 0x1e6000
+
+    // 1. 读取 config_base (固件在 RAM 中的配置基地址)
+    let rd_addr = RAM_FMAC_FW_ADDR + FW_CONFIG_BASE_OFFSET; // 0x120180
+    let config_base = ipc_mem_read(transport, rd_addr)?;
+    log::info!("[aic8800] config_base = 0x{:08x}", config_base);
+
+    // 2. 写入 patch 地址和数量
+    ipc_mem_write(transport, PATCH_ADDR_REG, start_addr)?; // 0x1e5318 = 0x1e6000
+    ipc_mem_write(transport, PATCH_NUM_REG, patch_num)?;   // 0x1e531c = 2
+
+    // 3. 写入 patch_tbl 条目
+    for (cnt, entry) in PATCH_TBL.iter().enumerate() {
+        let offset = (cnt as u32) * 8;
+        // 写入 patch 地址 (entry[0] + config_base)
+        ipc_mem_write(transport, start_addr + offset, entry[0] + config_base)?;
+        // 写入 patch 数据
+        ipc_mem_write(transport, start_addr + offset + 4, entry[1])?;
+    }
+
+    log::info!("[aic8800] aicwifi_patch_config done ({} entries)", PATCH_TBL.len());
+    Ok(())
+}
+
+/// AIC8801 系统配置 (时钟门控 + RF PLL)
+/// 使用 DBG_MEM_MASK_WRITE_REQ 进行带掩码的寄存器写入:
+///   new_val = (old_val & ~mask) | (data & mask)
+pub fn aicwifi_sys_config<H: SdioHost> (
+    transport: &mut IpcTransport<H>,
+) -> Result<(), SdioError> {
+    log::info!("[aic8800] === aicwifi_sys_config start ===");
+
+    for entry in SYSCFG_TBL_MASKED {
+        ipc_mem_mask_write(transport, entry[0], entry[1], entry[2])?;
+    }
+
+    for entry in RF_TBL_MASKED {
+        ipc_mem_mask_write(transport, entry[0], entry[1], entry[2])?;
+    }
+    log::info!("[aic8800] aicwifi_sys_config done");
+    Ok(())
+}
+
 /// AIC8801 固件初始化流程  
+/// 
+/// 完整流程:
+///   1. 上传主固件 (fmacfw.bin) → 0x120000
+///   2. 上传 WiFi patch (fmacfw_patch.bin) → 0x190000
+///   3. aicwifi_patch_config — 写入 patch 表
+///   4. aicwifi_sys_config — 时钟/RF 配置
+///   5. start_app(0x120000, HOST_START_APP_AUTO)
 pub fn init_aic8801_firmware<H: SdioHost>(
     transport: &mut IpcTransport<H>, 
     fw_set: &FirmwareSet
@@ -54,14 +115,12 @@ pub fn init_aic8801_firmware<H: SdioHost>(
         log::warn!("[aic8800] No patch firmware provided, skipping patch upload");
     }
 
-    // TODO: aicwifi_patch_config  (LDPC/AGC/TxGain/JumpTable)  
-    // TODO: aicwifi_sys_config    (RF PLL 配置)  
+    // 3. Patch 表配置
+    aicwifi_patch_config(transport)?;
 
-    // 3. (MVP 阶段省略) aicwifi_patch_config — 补丁表写入  
-    // TODO: patch_config_aic8801(transport)?;  
-  
-    // 4. (MVP 阶段省略) aicwifi_sys_config — 系统配置  
-    // TODO: sys_config_aic8801(transport)?;  
+    // 4. 系统配置 (时钟门控 + RF PLL)
+
+    aicwifi_sys_config(transport)?;
 
     // 5. 启动固件(start_from_bootrom) 
     let status = ipc_start_app(

@@ -12,6 +12,8 @@ use chip_id::*;
 use ipc_msg::{IpcTransport, ipc_mem_read};
 use fw_upload::{init_aic8801_firmware, init_aic8800dc_firmware, init_aic8800d80_firmware};
 use fw_data::{FirmwareSet, get_firmware_set};
+
+use crate::ipc_msg::ipc_mem_write;
 /// SDIO 功能寄存器初始化
 /// 
 /// `is_v3`: true = AIC8800D80/D80X2, false = AIC8801/DC/DW 
@@ -118,6 +120,23 @@ fn validate_chip_revision(chip: ChipVariant, rev: &ChipRevision) -> Result<(), S
     Ok(())  
 }
 
+/// BSP 系统配置 — 在固件上传前调用
+///
+/// 写入 10 个关键寄存器:
+///   - 时钟/PLL 配置 (0x40500014, 0x40500018, 0x40500004)
+///   - panic 修复 (0x40040000)
+///   - BBPLL 配置 (0x40040084, 0x40040080, 0x40100058)
+///   - PMIC 接口初始化 (0x50000000)
+///   - 26MHz 晶振分频 (0x50019150)
+///   - ★ 停止看门狗 (0x50017008) — 不停止会导致芯片在 ~1s 后复位
+fn aicbsp_system_config<H: SdioHost> (ipc: &mut IpcTransport<H>) -> Result<(), SdioError> {
+    for &(addr, data) in SYSCFG_TBL {  
+        ipc_mem_write(ipc, addr, data)?;  
+    }  
+    log::info!("[aic8800] aicbsp_system_config done (watchdog stopped)");
+    Ok(())  
+}
+
 /// 完整的固件初始化入口  
 ///  
 /// fw_data: 固件二进制数据 (fmacfw.bin 或 fw_patch.bin)  
@@ -139,6 +158,11 @@ pub fn firmware_init<H: SdioHost>(
 
     // 4. 验证芯片版本是否受支持
     validate_chip_revision(chip, &chip_rev)?;
+
+    // 4.5 BSP 系统配置 (停止看门狗, 配置 PMIC/时钟) — 必须在固件上传前执行
+    if matches!(chip, ChipVariant::Aic8801) {
+        aicbsp_system_config(&mut ipc)?;
+    }
 
     // 5. 选择固件 
     let fw_set = get_firmware_set(chip, &chip_rev).unwrap();

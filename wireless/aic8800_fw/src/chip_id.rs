@@ -95,6 +95,43 @@ pub const HOST_START_APP_DUMMY: u32 = 5;
 pub const FW_UPLOAD_CHUNK_SIZE: usize = 1024;  
 
 // ============================================================  
+// AIC8801 Patch 配置地址  
+// ============================================================  
+/// Patch 地址寄存器 (NORMAL mode)  
+pub const PATCH_ADDR_REG: u32 = 0x001e_5318;  
+/// Patch 数量寄存器 (NORMAL mode)  
+pub const PATCH_NUM_REG: u32 = 0x001e_531c;  
+/// Patch 表起始地址  
+pub const PATCH_TBL_START_ADDR: u32 = 0x001e_6000; 
+/// patch_tbl
+/// 默认: CONFIG_LINK_DET_5G 未定义, CONFIG_MCU_MESSAGE 未定义
+pub const PATCH_TBL: &[[u32; 2]] = &[
+    [0x0104, 0x0000_0000], // link_det_5g disabled
+]; 
+/// syscfg_tbl_masked: {addr, mask, data}
+pub const SYSCFG_TBL_MASKED: &[[u32; 3]] = &[
+    [0x4050_6024, 0x0000_00FF, 0x0000_00DF], // clock gate lp_level
+];
+/// rf_tbl_masked: {addr, mask, data}
+pub const RF_TBL_MASKED: &[[u32; 3]] = &[
+    [0x4034_4058, 0x0080_0000, 0x0000_0000], // PLL TRX
+];
+pub const SYSCFG_TBL: &[(u32, u32)] = &[  
+    (0x40500014, 0x00000101),  
+    (0x40500018, 0x00000109),  
+    (0x40500004, 0x00000010),  
+    (0x40040000, 0x00001AC8), // fix panic  
+    (0x40040084, 0x00011580),  
+    (0x40040080, 0x00000001),  
+    (0x40100058, 0x00000000),  
+    (0x50000000, 0x03220204), // PMIC init  
+    (0x50019150, 0x00000002), // 26MHz xtal div  
+    (0x50017008, 0x00000000), // STOP WATCHDOG  
+];  
+/// 固件 config_base 偏移 (RAM_FMAC_FW_ADDR + 0x180)  
+pub const FW_CONFIG_BASE_OFFSET: u32 = 0x0180;
+
+// ============================================================  
 // 芯片型号枚举  
 // ============================================================  
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]  

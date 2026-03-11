@@ -14,8 +14,8 @@ use crate::chip_id::{ChipVariant, ChipRevision, CHIP_REV_U01, CHIP_REV_U02};
   
 /// AIC8801 
 pub static FW_8801: &[u8] = include_bytes!("../firmware/fmacfw.bin");  
-pub static FW_8801_PATCH: &[u8] = include_bytes!("../firmware/fw_patch.bin"); 
-pub static FW_8801_PATCH_TBL: &[u8] = include_bytes!("../firmware/fw_patch_table.bin");
+pub static FW_8801_PATCH: &[u8] = include_bytes!("../firmware/fmacfw_patch.bin"); 
+pub static FW_8801_PATCH_TBL: &[u8] = &[];
 
 // ============================================================  
 // AIC8800DC 固件  
