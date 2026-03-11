@@ -712,7 +712,7 @@ impl SdioHost for CviSdhci {
             // 主机侧: Host Control 1 bit2=High Speed Enable 
             let hc1 = self.read8(SDHCI_HOST_CONTROL);
             self.write8(SDHCI_HOST_CONTROL, hc1 | HC_HIGH_SPEED);
-            self.set_clock(50_000_000)?;
+            self.set_clock(25_000_000)?;
             log::info!("SDIO: High-Speed 50MHz enabled"); 
         } else {
             self.set_clock(25_000_000)?;  

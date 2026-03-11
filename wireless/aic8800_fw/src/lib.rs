@@ -13,7 +13,7 @@ use ipc_msg::{IpcTransport, ipc_mem_read};
 use fw_upload::{init_aic8801_firmware, init_aic8800dc_firmware, init_aic8800d80_firmware};
 use fw_data::{FirmwareSet, get_firmware_set};
 
-use crate::ipc_msg::ipc_mem_write;
+use crate::ipc_msg::{ipc_mem_write, mm_get_fw_version, mm_get_mac_addr, mm_get_version, mm_reset, mm_set_stack_start};
 /// SDIO 功能寄存器初始化
 /// 
 /// `is_v3`: true = AIC8800D80/D80X2, false = AIC8801/DC/DW 
@@ -189,8 +189,84 @@ pub fn firmware_init<H: SdioHost>(
         }
     }
 
+    // 固件验证 (MM_RESET + MM_VERSION + STACK_START + FW_VERSION + MAC_ADDR)  
+    verify_firmware(&mut ipc)?;  
+
     log::info!("[aic8800] firmware_init complete"); 
 
     Ok(())
+}
+
+/// 固件验证 — 在 start_app 成功后调用  
+///  
+/// 通过 4 步验证固件是否正确加载并能响应 IPC 消息:  
+///   1. MM_RESET — 复位 MAC 层  
+///   2. MM_VERSION — 获取 LMAC/HW/PHY 版本  
+///   3. MM_SET_STACK_START — 启动协议栈, 获取 5G/vendor 信息  
+///   4. MM_GET_FW_VERSION — 获取固件版本字符串  
+///   5. MM_GET_MAC_ADDR — 获取 WiFi MAC 地址  
+///  
+/// 参考: rwnx_main.c rwnx_cfg80211_init() (line 5803-5835)  
+pub fn verify_firmware<H: SdioHost>(  
+    ipc: &mut IpcTransport<H>,  
+) -> Result<(), SdioError> {  
+    log::info!("[aic8800] === Firmware verification start ===");  
+  
+    // Step 1: MAC 层复位  
+    log::info!("[aic8800] Step 1/5: MM_RESET");  
+    mm_reset(ipc)?;  
+    log::info!("[aic8800] MM_RESET OK");  
+  
+    // Step 2: 获取版本信息  
+    log::info!("[aic8800] Step 2/5: MM_VERSION");  
+    let ver = mm_get_version(ipc)?;  
+    log::info!(  
+        "[aic8800] LMAC version : 0x{:08x}",  
+        ver.version_lmac  
+    );  
+    log::info!(  
+        "[aic8800] MAC HW       : 0x{:08x} / 0x{:08x}",  
+        ver.version_machw_1, ver.version_machw_2  
+    );  
+    log::info!(  
+        "[aic8800] PHY          : 0x{:08x} / 0x{:08x}",  
+        ver.version_phy_1, ver.version_phy_2  
+    );  
+    log::info!(  
+        "[aic8800] features=0x{:08x}, max_sta={}, max_vif={}",  
+        ver.features, ver.max_sta_nb, ver.max_vif_nb  
+    );  
+  
+    // Step 3: 启动协议栈  
+    log::info!("[aic8800] Step 3/5: MM_SET_STACK_START");  
+    let stack = mm_set_stack_start(ipc)?;  
+    log::info!(  
+        "[aic8800] is_5g_support={}, vendor_info=0x{:02x}",  
+        stack.is_5g_support, stack.vendor_info  
+    );  
+  
+    // Step 4: 获取固件版本字符串  
+    log::info!("[aic8800] Step 4/5: MM_GET_FW_VERSION");  
+    let fw_ver = mm_get_fw_version(ipc)?;  
+    let ver_len = (fw_ver.fw_version_len as usize).min(63);  
+    if let Ok(ver_str) = core::str::from_utf8(&fw_ver.fw_version[..ver_len]) {  
+        log::info!("[aic8800] Firmware version: {}", ver_str);  
+    } else {  
+        log::info!(  
+            "[aic8800] Firmware version (raw): {:?}",  
+            &fw_ver.fw_version[..ver_len]  
+        );  
+    }  
+  
+    // Step 5: 获取 MAC 地址  
+    log::info!("[aic8800] Step 5/5: MM_GET_MAC_ADDR");  
+    let mac = mm_get_mac_addr(ipc)?;  
+    log::info!(  
+        "[aic8800] MAC address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]  
+    );  
+  
+    log::info!("[aic8800] === Firmware verification PASSED ===");  
+    Ok(())  
 }
 
