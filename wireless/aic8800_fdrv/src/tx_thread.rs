@@ -11,20 +11,18 @@ use log;
 use crate::bus::{BusState, TxFrame, WifiBus};
 use sdhci_cv1800::regs::*;
 
-// ---- AIC8800 SDIO 寄存器/协议常量 ----  
-const SDIOWIFI_FUNC_BLOCKSIZE: usize = 512;  
-const SDIOWIFI_FLOW_CTRL_REG: u32 = 0x0A;  
-const SDIOWIFI_FLOWCTRL_MASK: u8 = 0x7F;  
-const SDIOWIFI_WR_FIFO_ADDR: u32 = 0x07;  
-const SDIO_TYPE_DATA: u8 = 0x00;  
-const TX_ALIGNMENT: usize = 4;  
-const TAIL_LEN: usize = 4;  
-const DATA_FLOW_CTRL_THRESH: u8 = 2;  
+const TAIL_LEN: usize = 4;   
 const BUFFER_SIZE: usize = 1536;  
 const FLOW_CTRL_CMD_RETRY: u32 = 10;  
 const FLOW_CTRL_DATA_RETRY: u32 = 50;  
 /// 每次 tx_process 最多处理的数据帧数，防止饿死其他任务  
 const TX_BATCH_LIMIT: u32 = 16;  
+const MAX_TX_QUEUE_LEN: usize = 256;
+
+#[derive(Debug)]
+pub enum TxError {
+    QueueFull,
+}
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -72,6 +70,8 @@ pub fn start(bus: Arc<WifiBus>) {
                 if did_work || has_pending_work(&bus) {
                     cx.waker().wake_by_ref();
                 }
+
+                bus.cmd_rsp_pollset.wake();
  
                 Poll::Pending
             }))
@@ -126,7 +126,7 @@ fn tx_process(bus: &WifiBus) -> bool {
                     }
                     // 让出锁和 CPU 再重试  
                     drop(sdio);  
-                    axtask::yield_now();  
+                    for _ in 0..10_000 { core::hint::spin_loop(); }   
                     sdio = bus.sdio.lock();  
                 }
             }
@@ -217,13 +217,6 @@ fn tx_process(bus: &WifiBus) -> bool {
         batch_count += 1;
     }
     did_work
-}
-
-const MAX_TX_QUEUE_LEN: usize = 256;
-
-#[derive(Debug)]
-pub enum TxError {
-    QueueFull,
 }
 
 /// 将以太网帧入队 TX 队列

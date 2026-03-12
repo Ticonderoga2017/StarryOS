@@ -2,26 +2,17 @@ use alloc::sync::Arc;
 use alloc::vec;
 use core::future::poll_fn;
 use core::task::Poll;
+use core::sync::atomic::Ordering;
 
-use axtask::future::{block_on, register_irq_waker};
-use log::{self, info};
+use axtask::future::block_on;
+use log;
 
 use crate::bus::{BusState, WifiBus};
-use sdhci_cv1800::{CviSdhci, regs::*};
+use sdhci_cv1800::{CviSdhci, mask_unmask_card_irq_raw, regs::*};
 use aic8800_sdio::SdioHost;
 
-const SDIO1_IRQ: usize = 38;
-const RX_HWHRD_LEN: usize = 60;
-const RX_ALIGNMENT: usize = 4;
-
-const SDIO_TYPE_DATA: u8         = 0x00;  
-const SDIO_TYPE_CFG: u8          = 0x10;  // 用于类型判断的 mask  
-const SDIO_TYPE_CFG_CMD_RSP: u8  = 0x11;  
-const SDIO_TYPE_CFG_DATA_CFM: u8 = 0x12;  
-const SDIO_TYPE_CFG_PRINT: u8    = 0x13;  
-  
-const SDIOWIFI_BLOCK_CNT_REG: u32 = 0x12;  
-const SDIOWIFI_RD_FIFO_ADDR: u32  = 0x08;  
+const RX_HWHRD_LEN: usize = 60;  
+const RX_ALIGNMENT: usize = 4;  
 const MAX_PKT_LEN: u16 = 1600;  
 const DUMMY_WORD_LEN: usize = 4;  
 
@@ -33,7 +24,7 @@ fn align_up(val: usize, align: usize) -> usize {
 pub fn start(bus: Arc<WifiBus>) {
     axtask::spawn_with_name(
         move || {
-            info!("[wifi-rx] thread started");
+            log::info!("[wifi-rx] thread started");
             block_on(poll_fn(|cx| {
                 // 检查总线状态
                 if *bus.state.lock() == BusState::Down {
@@ -41,9 +32,8 @@ pub fn start(bus: Arc<WifiBus>) {
                 }
                 // 处理所有待读数据
                 process_rx_frames(&bus);
-                // 注册 waker：下次 CARD_INT 时唤醒
-                // （双重检查：先处理 → 注册 → 再处理，避免 race）
-                register_irq_waker(SDIO1_IRQ, cx.waker());
+
+                bus.rx_irq_pollset.register(cx.waker());
 
                 // 二次检查（注册和中断之间可能有数据到达）
                 process_rx_frames(&bus);
@@ -66,14 +56,14 @@ fn process_rx_frames(bus: &WifiBus) {
             Ok(cnt) => cnt & 0x7F,
             Err(e) => {
                 log::error!("[wifi-rx] read block_cnt failed: {:?}", e);
-                CviSdhci::unmask_card_irq(sdio.mmio_base());
+                mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
                 break;
             }
         };
 
         if block_cnt == 0 {
             // 无数据，恢复 CARD_INT 信号
-            CviSdhci::unmask_card_irq(sdio.mmio_base());
+            mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
             break;
         }
 
@@ -82,7 +72,7 @@ fn process_rx_frames(bus: &WifiBus) {
         let mut buf = vec![0u8; data_len];
         if let Err(e) = sdio.read_fifo(1, SDIOWIFI_RD_FIFO_ADDR, &mut buf) {
             log::error!("[wifi-rx] read_fifo failed: {:?}", e);
-            CviSdhci::unmask_card_irq(sdio.mmio_base());
+            mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
             break;
         }
 

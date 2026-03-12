@@ -1,11 +1,25 @@
 #![no_std]
 
-mod regs;
+pub mod regs;
 pub mod hw_init;
 
 use core::ptr::{read_volatile, write_volatile};
 use aic8800_sdio::{SdioHost, cccr::*, cmd::*, error::SdioError};
 use crate::{hw_init::sdio1_hw_init, regs::*};
+
+/// ISR 中屏蔽 CARD_INT 信号（裸地址操作）  
+/// 清除/恢复 NORM_INT_SIG_EN 中的 CARD_INT 位  
+pub fn mask_unmask_card_irq_raw(base: usize, mask: bool) {  
+    unsafe {  
+        let addr = base.wrapping_add(SDHCI_NORM_INT_SIG_EN as usize);
+        let sig = if mask {
+            read_volatile(addr as *const u16) & !NORM_INT_CARD_INT
+        } else {
+            read_volatile(addr as *const u16) | NORM_INT_CARD_INT
+        };
+        write_volatile(addr as *mut u16, sig);  
+    }  
+}  
 
 /// CVI SoC WiFi SDIO 控制器  
 pub struct CviSdhci {  
@@ -25,6 +39,23 @@ impl CviSdhci {
          }
     }
 
+    pub fn mmio_base(&self) -> usize {
+        self.base
+    }
+
+    /// 使能 CARD_INT 中断信号（FDRV 初始化后调用）
+    /// PIO 操作（wait_cmd_complete、wait_buffer_read_ready 等）通过轮询 Status 寄存器工作，  
+    /// 不依赖中断信号。如果使能这些信号，ISR 会 W1C 清除状态位，与 PIO 轮询产生竞争条件。
+    pub fn enable_irq(&self) {
+        self.write16(SDHCI_NORM_INT_SIG_EN, NORM_INT_CARD_INT);
+        self.write16(SDHCI_ERR_INT_SIG_EN, 0);
+    }
+
+    pub fn disable_irq(&self) {  
+        self.write16(SDHCI_NORM_INT_SIG_EN, 0);  
+        self.write16(SDHCI_ERR_INT_SIG_EN, 0);  
+    }
+
     // ---- 底层 MMIO 操作 ---- 
     fn read32(&self, offset: u32) -> u32 {
         unsafe {
@@ -32,7 +63,7 @@ impl CviSdhci {
         }
     }
     
-    fn write32(&self, offset: u32, val: u32) {
+    pub fn write32(&self, offset: u32, val: u32) {
         unsafe {
             write_volatile((self.base + offset as usize) as *mut u32, val);
         }
@@ -78,9 +109,10 @@ impl CviSdhci {
             // 检查 Error 汇总位 (Normal Status bit 15)
             if norm_status & NORM_INT_ERROR != 0 {
                 let err_status = self.read16(SDHCI_INT_STATUS_ERR);
-                // 清除: 先清 error，再清 normal  
-                self.write16(SDHCI_INT_STATUS_ERR, err_status);  
-                self.write16(SDHCI_INT_STATUS_NORM, norm_status); 
+                // W1C 清除: 先清 error，再清 normal 的 ERROR 汇总位  
+                self.write16(SDHCI_INT_STATUS_ERR, err_status); 
+                // 只清除 NORM_INT_ERROR 位，不清除其他可能同时设置的位   
+                self.write16(SDHCI_INT_STATUS_NORM, NORM_INT_ERROR); 
 
                 if err_status & (ERR_INT_CMD_CRC | ERR_INT_DAT_CRC) != 0 {
                     return Err(SdioError::CrcError);
@@ -139,7 +171,9 @@ impl CviSdhci {
         Ok((resp & 0xFF) as u8)  
     }
 
-    // ---- CMD52 ----  
+    // ================================================================  
+    // CMD52  
+    // ================================================================  
 
     fn cmd52_read(&self, func: u8, addr: u32) -> Result<u8, SdioError> {
         if addr > SDIO_ADDR_MASK {
@@ -177,7 +211,9 @@ impl CviSdhci {
         self.check_r5_response(resp)  
     }
 
-    // ---- CMD53 ---- 
+    // ================================================================  
+    // CMD53  
+    // ================================================================ 
 
     fn cmd53_read(&self, func: u8, addr: u32, buf: &mut [u8], block_size: u16, use_block_mode: bool) -> Result<(), SdioError> {  
         if addr > SDIO_ADDR_MASK || buf.is_empty() {  
@@ -415,6 +451,22 @@ impl CviSdhci {
         Ok(())
     }
 
+    // ================================================================  
+    // PIO 等待方法（轮询 + DAT 线复位）  
+    // ================================================================ 
+    fn reset_dat_line(&self) {
+        self.write8(SDHCI_SOFTWARE_RESET, SOFTWARE_RESET_DAT);
+        let mut timeout = 100_000u32;
+        while self.read8(SDHCI_SOFTWARE_RESET) & SOFTWARE_RESET_DAT != 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                log::error!("SDHCI: DAT line reset timeout");  
+                break;  
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// 等待 Buffer Read Ready 中断状态位
     fn wait_buffer_read_ready(&self) -> Result<(), SdioError> {  
         for _ in 0..PIO_TIMEOUT {  
@@ -422,38 +474,15 @@ impl CviSdhci {
             if norm_status & NORM_INT_ERROR != 0 {  
                 let err = self.read16(SDHCI_INT_STATUS_ERR);
 
-                // 1. 清除错误状态 (W1C)  
+                // 清除错误状态 (W1C)  
                 self.write16(SDHCI_INT_STATUS_ERR, err); // 清除错误状态位
                 self.write16(SDHCI_INT_STATUS_NORM, NORM_INT_ERROR); // 清除错误汇总位;
                 log::error!("PIO read error: norm_status=0x{:04x}, err_status=0x{:04x}", norm_status, err);
                 
-                // 2. 软件复位 DAT 线 (SDHCI spec: offset 0x2F, bit 2)  
-                self.write8(SDHCI_SOFTWARE_RESET, SOFTWARE_RESET_DAT);
-                // 等待复位完成 (bit 自动清零)  
-                let mut reset_timeout = 100_000u32;
-                while self.read8(SDHCI_SOFTWARE_RESET) & SOFTWARE_RESET_DAT != 0 {
-                    reset_timeout -= 1;
-                    if reset_timeout == 0 {
-                        log::error!("SDHCI: DAT line reset timeout");  
-                        break;  
-                    }
-                    core::hint::spin_loop();
-                }
+                self.reset_dat_line();                
                 log::warn!("SDHCI: DAT line reset done");  
   
                 return Err(SdioError::IoError);  
-                // // 2. 清除 Error Interrupt Status (offset 0x32)  
-                // //    写 0xFFFF 清除所有错误位  
-                // let err_int_reg = base + 0x32;  
-                // unsafe { core::ptr::write_volatile(err_int_reg as *mut u16, 0xFFFF); }  
-                
-                // // 3. 清除 Normal Interrupt Status 的 Error Interrupt 位 (offset 0x30, bit 15)  
-                // let norm_int_reg = base + 0x30;  
-                // unsafe { core::ptr::write_volatile(norm_int_reg as *mut u16, 0x8000); }  
-                
-                // log::warn!("SDHCI: DAT line reset and error status cleared");  
-                
-                // return Err(SdioError::IoError);
             }  
             // 检查 Buffer Read Ready (bit 5)
             if norm_status & NORM_INT_BUF_RD_READY != 0 {  
@@ -475,6 +504,7 @@ impl CviSdhci {
                 self.write16(SDHCI_INT_STATUS_ERR, err); // 清除错误状态位
                 self.write16(SDHCI_INT_STATUS_NORM, NORM_INT_ERROR); // 清除错误汇总位;
                 log::error!("PIO write error: norm_status=0x{:04x}, err_status=0x{:04x}", norm_status, err);
+                self.reset_dat_line();
                 return Err(SdioError::IoError);
             }  
             // 检查 Buffer Write Ready (bit 4)
@@ -497,6 +527,7 @@ impl CviSdhci {
                 self.write16(SDHCI_INT_STATUS_ERR, err); // 清除错误状态位
                 self.write16(SDHCI_INT_STATUS_NORM, NORM_INT_ERROR); // 清除错误汇总位;
                 log::error!("Transfer error: norm_status=0x{:04x}, err_status=0x{:04x}", norm_status, err);
+                self.reset_dat_line();
                 return Err(SdioError::IoError);
             }  
             // 检查 Transfer Complete (bit 1)
@@ -730,12 +761,6 @@ impl SdioHost for CviSdhci {
 
         // 10. 使能 SDIO function 1
         self.enable_func(1)?;
-        // 等待 IO Ready  
-        for _ in 0..1000u32 {  
-            let io_ready = self.cmd52_read(0, CCCR_IO_READY)?;  
-            if io_ready & 0x02 != 0 { break; }  
-            for _ in 0..100 { core::hint::spin_loop(); }  
-        } 
         log::info!("SDIO: Function 1 enabled");
 
         // 11. 设置 function 1 block size = 512 

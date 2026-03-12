@@ -33,15 +33,8 @@ pub const DRV_TASK_ID: u16 = 100;
 /// CMD 超时（与 Linux RWNX_80211_CMD_TIMEOUT_MS 一致）  
 const CMD_TIMEOUT_MS: u64 = 6000;  
   
-/// SDIO 帧类型  
-const SDIO_TYPE_CFG_CMD_RSP: u8 = 0x11;  
-  
-/// SDIO 块大小  
-const SDIOWIFI_FUNC_BLOCKSIZE: usize = 512;  
-  
 // Frame construction constants  
 const DUMMY_WORD_LEN: usize = 4;  
-const TX_ALIGNMENT: usize = 4;  
 const TAIL_LEN: usize = 4;  
 const CMD_TX_TIMEOUT_DEFAULT_MS: u64 = 5000;  
 
@@ -146,7 +139,7 @@ fn build_cmd_frame(msg_id: u16, dest_task: u16, param: &[u8]) -> Vec<u8> {
     let msg_offset = 4 + DUMMY_WORD_LEN; // = 8  
     buf[msg_offset..msg_offset + 2].copy_from_slice(&msg_id.to_le_bytes());  
     buf[msg_offset + 2..msg_offset + 4].copy_from_slice(&dest_task.to_le_bytes());  
-    buf[msg_offset + 4..msg_offset + 6].copy_from_slice(&TASK_API.to_le_bytes()); // src_id  
+    buf[msg_offset + 4..msg_offset + 6].copy_from_slice(&DRV_TASK_ID.to_le_bytes()); // src_id  
     buf[msg_offset + 6..msg_offset + 8].copy_from_slice(&(param.len() as u16).to_le_bytes()); 
     
     // param [16..16+param.len()]  
@@ -218,7 +211,7 @@ pub fn send_cmd(
 
     // ---- 等待 CFM（RX 线程放入 cmd_rsp_queue）----
     let start = axhal::time::monotonic_time_nanos();
-    let timeout_ns = timeout_ms * 1_000_000;
+    let timeout_ns = timeout * 1_000_000;
 
     let result = block_on(poll_fn(|cx| {
         // 检查总线关闭 
@@ -272,10 +265,6 @@ pub fn send_cmd(
                 }                
             }
         }
-
-        // 设置超时唤醒：通过 yield 让出 CPU，下次调度时重新检查  
-        // （无硬件定时器 waker 时的简易超时方案）  
-        cx.waker().wake_by_ref(); 
 
         Poll::Pending
     }));

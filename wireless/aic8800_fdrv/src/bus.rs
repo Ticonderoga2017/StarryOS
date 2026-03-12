@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering
 use axpoll::PollSet;
 use axsync::Mutex;
 use kspin::SpinNoIrq;
-use sdhci_cv1800::{CviSdhci, regs::*};
+use sdhci_cv1800::{CviSdhci, mask_unmask_card_irq_raw, regs::*};
 use core::ptr::{read_volatile, write_volatile};
 use aic8800_sdio::SdioHost;
 
@@ -107,8 +107,7 @@ impl WifiBus {
         {
             let sdio = self.sdio.lock();
             let _ = sdio.write_byte(1, SDIOWIFI_INTR_CONFIG_REG, 0x00);
-            sdio.write32(SDHCI_INT_SIGNAL_EN, 0x00);
-            sdio.write32(SDHCI_INT_STATUS_EN, 0x00);
+            sdio.disable_irq();
         }
 
         // 3. 唤醒 TX 线程，等待其退出  
@@ -186,7 +185,7 @@ pub fn sdio1_irq_handler() {
     // CARD_INT (bit 8): AIC8800 有数据要发给主机
     if status & (NORM_INT_CARD_INT as u32) != 0 {
         // 屏蔽 CARD_INT 信号，防止重复触发（电平触发）
-        CviSdhci::mask_card_irq_raw(base);
+        mask_unmask_card_irq_raw(base, true);
         // 唤醒 wifi-rx 线程
         bus.rx_irq_pollset.wake();
     }
@@ -220,18 +219,19 @@ pub fn sdio1_irq_handler() {
             );
         }
     }
-    // 一次性 W1C 清除所有非 CARD_INT 的状态位  
-    let wlc_mask = status & !(NORM_INT_CARD_INT as u32);
-    if wlc_mask != 0 {
-        unsafe  {
-            write_volatile(
-                (base + SDHCI_INT_STATUS_ERR as usize) as *mut u32,
-                wlc_mask
-            );
-        }
-    }
+    // W1C 清除所有非 CARD_INT 的 Normal 状态位
+    //   CARD_INT 是电平触发，不能通过 W1C 清除，只能通过 mask 屏蔽 
+    let w1c_mask = (status & !(NORM_INT_CARD_INT as u32)) as u16;  
+    if w1c_mask != 0 {  
+        unsafe {  
+            write_volatile(  
+                (base + SDHCI_INT_STATUS_NORM as usize) as *mut u16,  
+                w1c_mask  
+            );  
+        }  
+    }  
     // 唤醒 SDHCI 等待者（CMD/XFER/BUF_RD/ERR 共用）  
-    if wlc_mask != 0 {
+    if w1c_mask != 0 {
         bus.sdhci_pollset.wake();
     }
 }

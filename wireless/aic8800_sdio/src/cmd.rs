@@ -54,5 +54,3 @@ pub const TM_MULTI_BLOCK:    u16 = 1 << 5;
 // ---- Present State Register 位定义 (补充) ----  
 pub const PSR_BUF_WR_EN:     u32 = 1 << 10;  // Buffer Write Enable  
 pub const PSR_BUF_RD_EN:     u32 = 1 << 11;  // Buffer Read Enable  
-
-pub const PIO_TIMEOUT: u32 = 1_000_000;  
