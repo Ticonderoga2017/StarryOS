@@ -113,6 +113,7 @@ sg2002 = [
     "dep:sdhci-cv1800",
     "dep:aic8800_sdio",
     "dep:aic8800_fw",
+    "dep:aic8800_fdrv",
     "axfeat/driver-ramdisk"]
 
 [dependencies]
@@ -156,6 +157,10 @@ optional = true
 
 [dependencies.aic8800_fw]  
 path = "wireless/aic8800_fw"  
+optional = true  
+
+[dependencies.aic8800_fdrv]  
+path = "wireless/aic8800_fdrv"  
 optional = true  
 
 [package.metadata.vendor-filter]

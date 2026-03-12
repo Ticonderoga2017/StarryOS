@@ -63,6 +63,9 @@ fn sdio1_probe() {
     use sdhci_cv1800::{CviSdhci, hw_init};  
     use aic8800_sdio::SdioHost;  
     use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
+    use alloc::sync::Arc;
+    use axsync::Mutex;
+    use wireless::aic8800_fdrv::bus::{BusState, WifiBus};
   
    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
