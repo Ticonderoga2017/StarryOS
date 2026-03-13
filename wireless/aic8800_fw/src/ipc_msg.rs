@@ -116,6 +116,10 @@ impl<'a, H: SdioHost> IpcTransport<'a, H> {
         }  
     }  
 
+    pub fn host(&mut self) -> &mut H {
+        self.sdio_host
+    }
+
     /// 构建 lmac_msg 头部 + transport header, 写入 tx_buf  
     /// 返回总长度 (含 transport header)  
     fn build_msg(&mut self, msg_id: u16, payload: &[u8]) -> usize {  

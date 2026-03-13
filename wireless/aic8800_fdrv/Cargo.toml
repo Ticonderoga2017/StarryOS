@@ -13,3 +13,4 @@ kspin = { workspace = true }
 axsync = { workspace = true }
 axtask = { workspace = true }
 axhal = { workspace = true }
+axplat = { version = "0.3", git = "https://github.com/arceos-org/axplat_crates.git", tag = "dev-v03", features = ["irq"] }

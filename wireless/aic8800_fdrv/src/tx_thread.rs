@@ -9,7 +9,7 @@ use axtask::future::block_on;
 use log;
 
 use crate::bus::{BusState, TxFrame, WifiBus};
-use sdhci_cv1800::regs::*;
+use sdhci_cv1800::{mask_unmask_card_irq_raw, regs::*};
 
 const TAIL_LEN: usize = 4;   
 const BUFFER_SIZE: usize = 1536;  
@@ -101,6 +101,8 @@ fn tx_process(bus: &WifiBus) -> bool {
             // 对 CMD 帧做对齐（对应 Linux aicwf_sdio_tx_msg 的 alignment + tail）
             let send_len = pad_cmd_frame(&mut cmd);            
 
+            log::info!("[wifi-tx] CMD frame ready, send_len={}", send_len); 
+
             // Flow control for CMD（对应 Linux aicwf_sdio_tx_msg 中的 flow_ctrl_msg）
             let mut fc_ok = false;
             {
@@ -110,6 +112,10 @@ fn tx_process(bus: &WifiBus) -> bool {
                     match sdio.read_byte(1, SDIOWIFI_FLOW_CTRL_REG) {
                         Ok(fc) => {
                             let fc_val = fc & SDIOWIFI_FLOWCTRL_MASK;
+                            log::info!(  
+                                "[wifi-tx] CMD flow_ctrl: raw=0x{:02x}, credits={}, retry={}",  
+                                fc, fc_val, retry  
+                            ); 
                             if fc_val != 0 {
                                 // 额外检查：buffer_cnt * BUFFER_SIZE 必须 > send_len  
                                 // 对应 Linux: buffer_cnt > 0 && len < (buffer_cnt * BUFFER_SIZE) 
@@ -137,6 +143,12 @@ fn tx_process(bus: &WifiBus) -> bool {
                     log::error!("[wifi-tx] CMD write_fifo failed: {:?}", e); 
                 } else {
                     did_work = true;
+                    // 发送后 unmask CARD_INT，让芯片回复的 CFM 能触发 ISR  
+                    let base = bus.sdio_mmio_base.load(Ordering::Acquire);  
+                    if base != 0 {  
+                        mask_unmask_card_irq_raw(base, false);  
+                    }  
+                    bus.rx_irq_pollset.wake(); 
                 }
             } else {
                 log::error!("[wifi-tx] CMD flow_ctrl timeout, dropping CMD");  
@@ -173,6 +185,10 @@ fn tx_process(bus: &WifiBus) -> bool {
             Ok(v) => v & SDIOWIFI_FLOWCTRL_MASK,
             Err(_) => break,
         };
+
+        if batch_count < 3 {  
+            log::debug!("[wifi-tx] DATA flow_ctrl: credits={}", fc);  
+        }  
 
         if fc <= DATA_FLOW_CTRL_THRESH {
             // credits 不足，等下次唤醒  
@@ -212,7 +228,14 @@ fn tx_process(bus: &WifiBus) -> bool {
         let sdio = bus.sdio.lock(); 
         if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &buf) {
             log::error!("[wifi-tx] DATA write_fifo failed: {:?}", e);  
-        }    
+        } else {
+            // 发送后 unmask CARD_INT  
+            let base = bus.sdio_mmio_base.load(Ordering::Acquire);  
+            if base != 0 {  
+                mask_unmask_card_irq_raw(base, false);  
+            }  
+            bus.rx_irq_pollset.wake();  
+        }
         did_work = true;    
         batch_count += 1;
     }

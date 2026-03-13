@@ -550,56 +550,7 @@ impl CviSdhci {
             core::hint::spin_loop();  
         }  
         Err(SdioError::Timeout)  
-    }
-
-    fn set_clock(&self, hz: u32) -> Result<(), SdioError> {
-        // 1. 从 Capabilities Register 读取 base clock
-        let caps = self.read32(SDHCI_CAPABILITIES);
-        let mut base_clock = ((caps >> 8) & 0xFF) as u32 * 1_000_000; // bits[15:8] = MHz
-        if base_clock == 0 {
-            // fallback: CVI SoC 默认 50MHz  
-            base_clock = 50_000_000u32;
-            log::warn!("Capabilities base_clock=0, fallback to 50MHz");  
-        }
-
-        // 2. 计算分频值 (确保实际频率 <= 目标频率) 
-        let divisor = if hz >= base_clock {
-            0u16 // 不分频
-        } else {
-            // 向上取整保证 base_clock / (2 * divisor) <= hz  
-            // 即 divisor >= base_clock / (2 * hz)  
-            let div = (base_clock + 2 * hz - 1) / (2 * hz);  
-            div.min(0x3FF) as u16  
-        };
-
-        // 3. 停止 SD clock output (保留 internal clock 状态，只清除 SD_CLK_EN) 
-        let mut clk_reg = self.read16(SDHCI_CLOCK_CONTROL);
-        clk_reg &= !(CC_SD_CLK_EN | CC_INT_CLK_EN);
-        self.write16(SDHCI_CLOCK_CONTROL, clk_reg);
-
-        // 4. 写入分频值 (10-bit: 高 2 位写入 bits[7:6], 低 8 位写入 bits[15:8])  
-        clk_reg &= !(CC_FREQ_SEL_MASK | CC_FREQ_SEL_EXT_MASK);  
-        let freq_sel = ((divisor & 0xFF) << CC_DIV_SHIFT as u16) as u16; // 低 8 位  
-        let ext_sel = (((divisor >> 8) & 0x03) << CC_EXT_DIV_SHIFT as u16) as u16; // 高 2 位  
-        clk_reg |= freq_sel | ext_sel | CC_INT_CLK_EN;  
-        self.write16(SDHCI_CLOCK_CONTROL, clk_reg);  
-
-        // 5. 等待 Internal Clock Stable (带超时) 
-        self.wait_clock_stable()?;
-
-        // 6. 启用 SD clock output  
-        clk_reg = self.read16(SDHCI_CLOCK_CONTROL);  
-        self.write16(SDHCI_CLOCK_CONTROL, clk_reg | CC_SD_CLK_EN); 
-
-        let actual_freq = if divisor == 0 {
-            base_clock
-        } else {
-            base_clock / (2 * divisor as u32) 
-        };
-        log::debug!("SDHCI clock: target={}Hz, divisor={}, actual={}Hz", hz, divisor, actual_freq);  
-  
-        Ok(()) 
-    }
+    }    
 
     /// 等待软件复位完成 
     fn wait_reset_complete(&self) -> Result<(), SdioError> {
@@ -833,6 +784,55 @@ impl SdioHost for CviSdhci {
     
         log::debug!("SDIO func{} block size set to {}", func, size);  
         Ok(())  
+    }
+
+    fn set_clock(&self, hz: u32) -> Result<(), SdioError> {
+        // 1. 从 Capabilities Register 读取 base clock
+        let caps = self.read32(SDHCI_CAPABILITIES);
+        let mut base_clock = ((caps >> 8) & 0xFF) as u32 * 1_000_000; // bits[15:8] = MHz
+        if base_clock == 0 {
+            // fallback: CVI SoC 默认 50MHz  
+            base_clock = 50_000_000u32;
+            log::warn!("Capabilities base_clock=0, fallback to 50MHz");  
+        }
+
+        // 2. 计算分频值 (确保实际频率 <= 目标频率) 
+        let divisor = if hz >= base_clock {
+            0u16 // 不分频
+        } else {
+            // 向上取整保证 base_clock / (2 * divisor) <= hz  
+            // 即 divisor >= base_clock / (2 * hz)  
+            let div = (base_clock + 2 * hz - 1) / (2 * hz);  
+            div.min(0x3FF) as u16  
+        };
+
+        // 3. 停止 SD clock output (保留 internal clock 状态，只清除 SD_CLK_EN) 
+        let mut clk_reg = self.read16(SDHCI_CLOCK_CONTROL);
+        clk_reg &= !(CC_SD_CLK_EN | CC_INT_CLK_EN);
+        self.write16(SDHCI_CLOCK_CONTROL, clk_reg);
+
+        // 4. 写入分频值 (10-bit: 高 2 位写入 bits[7:6], 低 8 位写入 bits[15:8])  
+        clk_reg &= !(CC_FREQ_SEL_MASK | CC_FREQ_SEL_EXT_MASK);  
+        let freq_sel = ((divisor & 0xFF) << CC_DIV_SHIFT as u16) as u16; // 低 8 位  
+        let ext_sel = (((divisor >> 8) & 0x03) << CC_EXT_DIV_SHIFT as u16) as u16; // 高 2 位  
+        clk_reg |= freq_sel | ext_sel | CC_INT_CLK_EN;  
+        self.write16(SDHCI_CLOCK_CONTROL, clk_reg);  
+
+        // 5. 等待 Internal Clock Stable (带超时) 
+        self.wait_clock_stable()?;
+
+        // 6. 启用 SD clock output  
+        clk_reg = self.read16(SDHCI_CLOCK_CONTROL);  
+        self.write16(SDHCI_CLOCK_CONTROL, clk_reg | CC_SD_CLK_EN); 
+
+        let actual_freq = if divisor == 0 {
+            base_clock
+        } else {
+            base_clock / (2 * divisor as u32) 
+        };
+        log::debug!("SDHCI clock: target={}Hz, divisor={}, actual={}Hz", hz, divisor, actual_freq);  
+  
+        Ok(()) 
     }
 
     /// 使能指定 SDIO function (1-7)  

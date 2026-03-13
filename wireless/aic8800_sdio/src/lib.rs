@@ -35,12 +35,14 @@ pub trait SdioHost: Send + Sync {
     /// 设置指定 function 的 block size  
     fn set_block_size(&self, func: u8, size: u16) -> Result<(), SdioError>;  
   
+    fn set_clock(&self, hz: u32) -> Result<(), SdioError> {  
+        Ok(()) // 默认空实现  
+    }
     /// 使能指定 SDIO function  
     fn enable_func(&self, func: u8) -> Result<(), SdioError>;  
   
     /// 注册 SDIO 中断回调 (可选, 轮询模式下为空实现)  
     fn claim_irq(&self, func: u8, handler: fn()) -> Result<(), SdioError> {  
-        let _ = (func, handler);  
         Ok(()) // 默认: 轮询模式, 不注册中断  
     }  
   

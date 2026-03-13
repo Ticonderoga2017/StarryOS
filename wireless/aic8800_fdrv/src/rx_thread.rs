@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec;
-use core::future::poll_fn;
+use core::hint;
+use core::{future::poll_fn, sync::atomic::AtomicU64};
 use core::task::Poll;
 use core::sync::atomic::Ordering;
 
@@ -8,13 +9,20 @@ use axtask::future::block_on;
 use log;
 
 use crate::bus::{BusState, WifiBus};
-use sdhci_cv1800::{CviSdhci, mask_unmask_card_irq_raw, regs::*};
+use sdhci_cv1800::{mask_unmask_card_irq_raw, regs::*};
 use aic8800_sdio::SdioHost;
 
 const RX_HWHRD_LEN: usize = 60;  
 const RX_ALIGNMENT: usize = 4;  
 const MAX_PKT_LEN: u16 = 1600;  
-const DUMMY_WORD_LEN: usize = 4;  
+const SDIO_OTHER_INTERRUPT: u8 = 0x80; 
+
+/// block_cnt=0 时的最大轮询次数（每次 ~100us，500 次 ≈ 50ms）  
+const BLOCK_CNT_POLL_MAX: u32 = 500;  
+/// 每次轮询间隔的 spin_loop 次数（~100us @ 25MHz）  
+const BLOCK_CNT_POLL_INTERVAL: u32 = 2_500;  
+
+pub static RX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);  
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -25,7 +33,13 @@ pub fn start(bus: Arc<WifiBus>) {
     axtask::spawn_with_name(
         move || {
             log::info!("[wifi-rx] thread started");
-            block_on(poll_fn(|cx| {
+
+            block_on(poll_fn(move |cx| {
+                let wake_cnt = RX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);  
+                if wake_cnt > 0 {  
+                    log::info!("[wifi-rx] woke up (count={})", wake_cnt);  
+                } 
+
                 // 检查总线状态
                 if *bus.state.lock() == BusState::Down {
                     return Poll::Ready(());
@@ -47,133 +61,175 @@ pub fn start(bus: Arc<WifiBus>) {
 
 /// 读取 SDIO FIFO 中的所有帧并按类型分发
 fn process_rx_frames(bus: &WifiBus) {
-    loop {
-        // 持锁读 SDIO
-        let mut sdio = bus.sdio.lock();
+    let mut read_any = false;
 
-        // 读 block_cnt_reg (AIC8801: 0x12)
-        let block_cnt = match sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG) {
-            Ok(cnt) => cnt & 0x7F,
-            Err(e) => {
-                log::error!("[wifi-rx] read block_cnt failed: {:?}", e);
-                mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
-                break;
+    loop {
+        let block_cnt = {
+            let sdio = bus.sdio.lock();
+            match sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("[wifi-rx] read block_cnt failed: {:?}", e);
+                    // mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
+                    break;
+                }
             }
         };
 
+        if block_cnt & SDIO_OTHER_INTERRUPT != 0 {
+            log::warn!("[wifi-rx] SDIO_OTHER_INTERRUPT (0x{:02x}), re-read", block_cnt);  
+            continue;  
+        }
+
         if block_cnt == 0 {
-            // 无数据，恢复 CARD_INT 信号
-            mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
-            break;
+            let mut found = false;
+            for poll_i in 0..500u32 {
+                for _ in 0..100u32 { core::hint::spin_loop(); }
+
+                let cnt = {
+                    let sdio = bus.sdio.lock();
+                    sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG).unwrap_or(0)
+                };
+
+                if cnt & SDIO_OTHER_INTERRUPT != 0 {
+                    continue;
+                }
+
+                if cnt > 0 {
+                    log::info!(  
+                        "[wifi-rx] block_cnt became {} after {}x100us wait",  
+                        cnt, poll_i + 1  
+                    );  
+                    found = true;  
+                    break; 
+                }
+            }
+
+            if !found  {
+                log::info!("[wifi-rx] block_cnt=0 after 50ms wait, CARD_INT stays masked");  
+                break;
+            }
+            continue;
         }
 
-        // 计算数据长度并读 FIFO
-        let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;
-        let mut buf = vec![0u8; data_len];
-        if let Err(e) = sdio.read_fifo(1, SDIOWIFI_RD_FIFO_ADDR, &mut buf) {
-            log::error!("[wifi-rx] read_fifo failed: {:?}", e);
-            mask_unmask_card_irq_raw(bus.sdio_mmio_base.load(Ordering::Acquire), false);
-            break;
+        log::info!("[wifi-rx] block_cnt={}", block_cnt);  
+        let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;  
+        let mut buf = vec![0u8; data_len]; 
+        {
+            let sdio = bus.sdio.lock();
+            if let Err(e) = sdio.read_fifo(1, SDIOWIFI_RD_FIFO_ADDR, &mut buf) {  
+                log::error!("[wifi-rx] read_fifo failed: {:?}", e);  
+                break;  
+            }  
         }
 
-        // 释放 SDIO 锁后再处理帧（减少持锁时间）
-        drop(sdio);
+        read_any = true;
+        dispatch_frames(bus, &buf);        
+    }
 
-        // 解析并分发帧（可能有聚合帧）
-        dispatch_frames(bus, &buf);
+    if read_any {
+        let base = bus.sdio_mmio_base.load(Ordering::Acquire);
+        if base != 0 {
+            mask_unmask_card_irq_raw(base, false);
+        }
     }
 }
 
-/// 解析 SDIO 帧并按类型分发到对应队列
-fn dispatch_frames(bus: &WifiBus, data: &[u8]) {
+/// 解析 SDIO FIFO 中的聚合帧并按类型分发  
+///  
+/// buf 布局：一个或多个 SDIO 帧紧密排列（4 字节对齐）  
+/// 每帧：[SDIO_HDR(4)] [payload(pkt_len)] [padding]  
+///  
+/// DATA 帧：pkt_len 包含 SDIO header 4 字节  
+///   advance = roundup(pkt_len + RX_HWHRD_LEN, RX_ALIGNMENT)  
+///  
+/// CFG 帧：pkt_len 不包含 SDIO header 4 字节  
+///   advance = roundup(pkt_len, RX_ALIGNMENT) + 4  
+fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
     let mut offset = 0;
-    while offset + 4 <= data.len() {
-        // sdio_header: [len_lo, len_hi, type, ...]
-        let pkt_len = (data[offset] as u16) | ((data[offset + 1] as u16 & 0x0F) << 8);
 
-        if pkt_len == 0{
+    while offset + 4 <= buf.len() {
+        let pkt_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+        if pkt_len == 0 || pkt_len > MAX_PKT_LEN as usize {
             break;
         }
-        let frame_type = data[offset + 2] & 0x7F;
 
-        // 合法性检查  
-        if pkt_len > MAX_PKT_LEN {
-            log::warn!("[wifi-rx] pkt_len {} > {}, skip rest", pkt_len, MAX_PKT_LEN);  
-            break;  
-        }
-
-        // 判断帧类型：bit4 为 1 → CFG 类帧，否则为数据帧  
-        if (frame_type & SDIO_TYPE_CFG) != SDIO_TYPE_CFG {
-            // ---- 数据帧 ----  
-            // Linux: aggr_len = pkt_len + RX_HWHRD_LEN  
-            // RX_HWHRD_LEN(60) 包含 sdio_header(4) + hw_rxhdr(56)  
-            // 所以 aggr_len 是从 data[offset] 开始的完整帧长度 
-            let aggr_len = pkt_len as usize + RX_HWHRD_LEN;
-            let adjust_len = align_up(aggr_len, RX_ALIGNMENT);
-
-            if offset + aggr_len > data.len() {  
-                log::warn!("[wifi-rx] data frame truncated: need {}, have {}",  
-                    aggr_len, data.len() - offset);  
-                break;  
-            } 
-
-            // 拷贝完整帧（含 sdio_header + hw_rxhdr + 802.11 payload）  
-            let frame = data[offset..offset + aggr_len].to_vec();
-            bus.data_rx_queue.lock().push_back(frame);
-            bus.data_rx_pollset.wake();
-
-            // 数据帧：前进 adjust_len（不加 4，因为 RX_HWHRD_LEN 已含 sdio_header）  
-            offset += adjust_len; 
-        } else {
-            // ---- CFG 类帧 (CMD_RSP / DATA_CFM / PRINT) ----  
-            // Linux: aggr_len = pkt_len（不含 sdio_header）  
-            // 完整帧 = sdio_header(4) + pkt_len  
-            let aggr_len = pkt_len as usize;  
-            let adjust_len = align_up(aggr_len, RX_ALIGNMENT);  
+        let pkt_type = buf[offset + 2] & 0x7F; // bit6..0 = type, bit7 reserved  
+        let is_cfg = (pkt_type & SDIO_TYPE_CFG) == SDIO_TYPE_CFG;
+        if !is_cfg {
+            // ========== DATA 帧 ==========  
+            // pkt_len 包含 SDIO header 的 4 字节（Linux: aggr_len = pkt_len + RX_HWHRD_LEN）  
+            // 实际数据从 offset 开始，长度 = pkt_len + RX_HWHRD_LEN  
+            let aggr_len = pkt_len + RX_HWHRD_LEN;  
+            let advance = align_up(aggr_len, RX_ALIGNMENT);  
   
-            if offset + adjust_len + 4 > data.len() {  
-                log::warn!("[wifi-rx] cfg frame truncated");  
+            if offset + aggr_len > buf.len() {  
+                log::warn!("[wifi-rx] DATA frame truncated at offset={}", offset);  
+                break;  
+            }
+
+            // 802.11 payload 从 offset+4 开始，长度 = pkt_len - 4（去掉 SDIO header）  
+            // hw_rxhdr 从 offset+pkt_len 开始，长度 = RX_HWHRD_LEN  
+            let data_payload = &buf[offset..offset + aggr_len];  
+            log::info!(  
+                "[wifi-rx] DATA frame, pkt_len={}, aggr_len={}",  
+                pkt_len, aggr_len  
+            ); 
+
+            // TODO: 将 data_payload 送入网络栈  
+            // 当前阶段只记录日志  
+            let mut queue = bus.data_rx_queue.lock();  
+            queue.push_back(data_payload.to_vec());  
+            drop(queue);  
+            offset += advance; 
+        } else {
+            // ========== CFG 帧 ==========  
+            // pkt_len 不包含 SDIO header 的 4 字节  
+            // ipc_e2a_msg 从 offset+4 开始，长度 = pkt_len  
+            let msg_start = offset + 4;  
+            let msg_end = msg_start + pkt_len;  
+  
+            if msg_end > buf.len() {  
+                log::warn!("[wifi-rx] CFG frame truncated at offset={}", offset);  
                 break;  
             }  
 
-            let sub_type = frame_type & 0x7F;  
-            match sub_type {
+            let msg_data = &buf[msg_start..msg_end];
+            let cfg_subtype = pkt_type & 0x7F;
+
+            // 帧间偏移 = roundup(pkt_len, RX_ALIGNMENT) + 4  
+            let advance = align_up(pkt_len, RX_ALIGNMENT) + 4;  
+            match cfg_subtype {
                 SDIO_TYPE_CFG_CMD_RSP => {
-                    // SDIO_TYPE_CFG_CMD_RSP  
-                    // Linux: rwnx_rx_handle_msg(hw, (ipc_e2a_msg *)(msg + 4))  
-                    // msg+4 = 跳过 sdio_header 后再跳过 dummy word  
-                    // 即 data[offset + 4 + DUMMY_WORD_LEN .. offset + aggr_len + 4]  
-                    if DUMMY_WORD_LEN <= aggr_len {
-                        let msg = data[offset + 4 + DUMMY_WORD_LEN..offset + aggr_len + 4].to_vec();
-                        bus.cmd_rsp_queue.lock().push_back(msg);
-                        bus.cmd_rsp_pollset.wake();
+                    // ipc_e2a_msg: [id(2)][dummy_dest(2)][dummy_src(2)][param_len(2)][pattern(4)][param...]  
+                    if msg_data.len() >= 8 {
+                        let msg_id = u16::from_le_bytes([msg_data[0], msg_data[1]]); 
+                        let param_len = u16::from_le_bytes([msg_data[6], msg_data[7]]);  
+                        log::info!(  
+                            "[wifi-rx] CFG_CMD_RSP: msg_id=0x{:04x}, param_len={}, total={}",  
+                            msg_id, param_len, msg_data.len()  
+                        );
                     }
+                    let mut queue = bus.cmd_rsp_queue.lock();
+                    queue.push_back(msg_data.to_vec());
+                    drop(queue);
+                    bus.cmd_rsp_pollset.wake();
                 }
-                SDIO_TYPE_CFG_DATA_CFM => {
-                    if DUMMY_WORD_LEN <= aggr_len {
-                        let cfm = data[offset + 4 + DUMMY_WORD_LEN..offset + aggr_len + 4].to_vec();
-                        bus.tx_cfm_queue.lock().push_back(cfm);
-                        bus.tx_cfm_pollset.wake();
-                    }
-                }
-                SDIO_TYPE_CFG_PRINT => {
-                    // SDIO_TYPE_CFG_PRINT  
-                    // Linux: rwnx_rx_handle_print(hw, msg + 4, aggr_len)  
-                    // msg+4 = 跳过 sdio_header，aggr_len 包含 dummy word  
-                    // 实际字符串从 dummy word 之后开始  
-                    if DUMMY_WORD_LEN <= aggr_len {
-                        let print_data = &data[offset + 4 + DUMMY_WORD_LEN..offset + aggr_len + 4];
-                        if let Ok(s) = core::str::from_utf8(print_data) {
-                            log::info!("[AIC8800] {}", s.trim_end_matches('\0').trim()); 
-                        }
-                    }
-                }
-                _ => {
-                    log::warn!("[wifi-rx] unknown cfg sub_type: 0x{:02x}", sub_type); 
+                SDIO_TYPE_CFG_DATA_CFM => {  
+                    log::info!("[wifi-rx] DATA_CFM frame, len={}", pkt_len);  
+                    // TX 确认 → 释放 flow control credits  
+                } 
+                SDIO_TYPE_CFG_PRINT => {  
+                    // 固件调试输出  
+                    if let Ok(s) = core::str::from_utf8(msg_data) {  
+                        log::info!("[fw-print] {}", s.trim_end_matches('\0'));  
+                    }  
+                }  
+                _ => {  
+                    log::warn!("[wifi-rx] unknown frame type=0x{:02x}, len={}", cfg_subtype, pkt_len);  
                 }
             }
-            // CFG 帧：前进 adjust_len + 4（sdio_header 不计入 pkt_len）  
-            offset += adjust_len + 4;  
-        }       
+            offset += advance; 
+        }     
     }
 }

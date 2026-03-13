@@ -34,9 +34,9 @@ pub const DRV_TASK_ID: u16 = 100;
 const CMD_TIMEOUT_MS: u64 = 6000;  
   
 // Frame construction constants  
-const DUMMY_WORD_LEN: usize = 4;  
-const TAIL_LEN: usize = 4;  
-const CMD_TX_TIMEOUT_DEFAULT_MS: u64 = 5000;  
+pub const DUMMY_WORD_LEN: usize = 4;  
+pub const TAIL_LEN: usize = 4;  
+pub const CMD_TX_TIMEOUT_DEFAULT_MS: u64 = 5000;  
 
 /// LMAC 消息头（对应 Linux struct lmac_msg）
 #[repr(C)]
@@ -46,22 +46,21 @@ pub struct LmacMsg {
     pub dest_id: u16,
     pub src_id: u16,
     pub param_len: u16,
+    pub pattern: u32, 
 }
 
 impl LmacMsg {
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = 12;
 
     /// 从字节切片解析 LmacMsg（小端序） 
-    pub fn from_le_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::SIZE {
-            return None;
-        } 
-        Some(Self { 
+    pub fn from_le_bytes(data: &[u8]) -> Self {
+        Self { 
             id: u16::from_le_bytes([data[0], data[1]]),
             dest_id: u16::from_le_bytes([data[2], data[3]]), 
             src_id: u16::from_le_bytes([data[4], data[5]]), 
             param_len: u16::from_le_bytes([data[6], data[7]]), 
-        })
+            pattern: u32::from_le_bytes([data[8], data[9], data[10], data[11]]), 
+        }
     }
 
     /// 序列化为 8 字节小端序 
@@ -89,6 +88,20 @@ pub const fn lmac_first_msg(task: u16) -> u16 {
 pub const fn msg_index(msg_id: u16) -> u16 {  
     msg_id & ((1 << 10) - 1)  
 } 
+
+// ============================================================  
+// LMAC 消息 ID（TASK_MM = 0, LMAC_FIRST_MSG(0) = 0）  
+// ============================================================  
+pub const MM_SET_STACK_START_REQ: u16 = 0x007B; // 枚举偏移 123  
+pub const MM_SET_STACK_START_CFM: u16 = 0x007C;  
+
+// MM 消息 (TASK_MM = 0)  
+pub const MM_RESET_REQ: u16           = lmac_first_msg(TASK_MM);      // 0x0000  
+pub const MM_RESET_CFM: u16           = lmac_first_msg(TASK_MM) + 1;  // 0x0001  
+pub const MM_START_REQ: u16           = lmac_first_msg(TASK_MM) + 2;  // 0x0002  
+pub const MM_START_CFM: u16           = lmac_first_msg(TASK_MM) + 3;  // 0x0003  
+pub const MM_VERSION_REQ: u16         = lmac_first_msg(TASK_MM) + 4;  // 0x0004  
+pub const MM_VERSION_CFM: u16         = lmac_first_msg(TASK_MM) + 5;  // 0x0005
 
 #[derive(Debug)]
 pub enum CmdError {
@@ -186,6 +199,11 @@ pub fn send_cmd(
     // 期望的 CFM ID = REQ ID + 1（LMAC 约定） 
     let expected_cfm_id = msg_id + 1;
 
+    log::info!(  
+        "[cmd_mgr] TX msg_id=0x{:04x}, dest=0x{:04x}, param_len={}, frame_len={}, timeout={}ms",  
+        msg_id, dest_id, param.len(), frame.len(), timeout  
+    ); 
+
     // 清空残留的 CMD 响应队列（避免旧响应干扰）  
     {
         let mut queue = bus.cmd_rsp_queue.lock();
@@ -222,6 +240,10 @@ pub fn send_cmd(
         // 检查超时
         let elapsed = axhal::time::monotonic_time_nanos() - start;
         if elapsed > timeout_ns {
+            log::error!(  
+                "[cmd_mgr] TIMEOUT waiting for cfm 0x{:04x} (elapsed={}ms)",  
+                expected_cfm_id, elapsed / 1_000_000  
+            );  
             return Poll::Ready(Err(CmdError::Timeout));
         }
 
@@ -230,22 +252,31 @@ pub fn send_cmd(
             let mut queue = bus.cmd_rsp_queue.lock();
             if let Some(rsp) = queue.pop_front() {
                 // 验证 CFM ID 
-                if rsp.len() >= 8 {
-                    let rsp_msg = LmacMsg::from_le_bytes(&rsp);
-                    if let Some(ref msg) = rsp_msg {
-                        if msg.id == expected_cfm_id {
-                            return Poll::Ready(Ok(rsp)); 
+                if rsp.len() >= LmacMsg::SIZE {
+                    let msg = LmacMsg::from_le_bytes(&rsp);
+                    if msg.id == expected_cfm_id {
+                        log::info!(  
+                            "[cmd_mgr] RX cfm_id=0x{:04x}, param_len={}, pattern=0x{:08x}",  
+                            msg.id, msg.param_len, msg.pattern  
+                        );
+                        let param_start = LmacMsg::SIZE;
+                        let param_end = param_start + msg.param_len as usize;
+                        if rsp.len() >= param_end {
+                            return Poll::Ready(Ok(rsp[param_start..param_end].to_vec()));
                         } else {
-                            log::warn!(  
-                                "[cmd_mgr] CFM id mismatch: expected 0x{:04x}, got 0x{:04x}",  
-                                expected_cfm_id,  
-                                msg.id  
-                            );  
+                            return Poll::Ready(Ok(rsp[param_start..].to_vec()));  
                         }
+                    } else {
+                        log::warn!(  
+                            "[cmd_mgr] CFM id mismatch: expected 0x{:04x}, got 0x{:04x}",  
+                            expected_cfm_id,  
+                            msg.id  
+                        );  
                     }
-                }
-                // 响应格式无效，丢弃  
-                log::warn!("[cmd_mgr] invalid CFM response, len={}", rsp.len());  
+                } else {
+                    // 响应格式无效，丢弃  
+                    log::warn!("[cmd_mgr] invalid CFM response, len={}", rsp.len());  
+                }                
             }
         }        
 
@@ -256,11 +287,20 @@ pub fn send_cmd(
         {
             let mut queue = bus.cmd_rsp_queue.lock();
             if let Some(rsp) = queue.pop_front() {
-                if rsp.len() >= 8 {
-                    if let Some(ref msg) = LmacMsg::from_le_bytes(&rsp) {
-                        if msg.id == expected_cfm_id {
-                            return Poll::Ready(Ok(rsp));
-                        }
+                if rsp.len() >= LmacMsg::SIZE {
+                    let msg = LmacMsg::from_le_bytes(&rsp);
+                    if msg.id == expected_cfm_id {
+                        log::info!(  
+                            "[cmd_mgr] RX cfm_id=0x{:04x} (double-check), param_len={}",  
+                            msg.id, msg.param_len  
+                        ); 
+                        let param_start = LmacMsg::SIZE;  
+                        let param_end = param_start + msg.param_len as usize; 
+                        if rsp.len() >= param_end {  
+                            return Poll::Ready(Ok(rsp[param_start..param_end].to_vec()));  
+                        } else {  
+                            return Poll::Ready(Ok(rsp[param_start..].to_vec()));  
+                        } 
                     }
                 }                
             }
@@ -268,6 +308,11 @@ pub fn send_cmd(
 
         Poll::Pending
     }));
+
+    match &result {  
+        Ok(rsp) => log::info!("[cmd_mgr] send_cmd 0x{:04x} OK, rsp_len={}", msg_id, rsp.len()),  
+        Err(e) => log::error!("[cmd_mgr] send_cmd 0x{:04x} FAILED: {:?}", msg_id, e),  
+    }  
 
     result
 }
@@ -282,6 +327,8 @@ pub fn send_cmd_no_cfm(
     if *bus.state.lock() == BusState::Down {  
         return Err(CmdError::BusDown);  
     }  
+
+    log::info!("[cmd_mgr] TX (no_cfm) msg_id=0x{:04x}, dest=0x{:04x}", msg_id, dest_id);  
 
     let frame = build_cmd_frame(msg_id, dest_id, param);
     {

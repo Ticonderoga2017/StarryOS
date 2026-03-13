@@ -132,6 +132,44 @@ impl WifiBus {
     
         log::info!("[wifi-bus] shutdown: interrupts disabled, threads notified"); 
     }
+
+      pub fn dump_status(&self) {  
+        let base = self.sdio_mmio_base.load(Ordering::Relaxed);  
+        let irq_cnt = IRQ_COUNT.load(Ordering::Relaxed);  
+        let state = *self.state.lock();  
+        let tx_pktcnt = self.tx_pktcnt.load(Ordering::Relaxed);  
+        let cmd_pending = self.cmd_pending_flag.load(Ordering::Relaxed);  
+        let cmd_error = self.cmd_rsp_error.load(Ordering::Relaxed);  
+  
+        log::info!("=== WifiBus Status ===");  
+        log::info!("  mmio_base: 0x{:x}", base);  
+        log::info!("  state: {:?}", state);  
+        log::info!("  irq_count: {}", irq_cnt);  
+        log::info!("  tx_pktcnt: {}", tx_pktcnt);  
+        log::info!("  cmd_pending: {}", cmd_pending);  
+        log::info!("  cmd_rsp_error: {}", cmd_error);  
+        log::info!("  cmd_rsp_queue len: {}", self.cmd_rsp_queue.lock().len());  
+        log::info!("  data_rx_queue len: {}", self.data_rx_queue.lock().len());  
+        log::info!("  tx_queue len: {}", self.tx_queue.lock().len());  
+  
+        if base != 0 {  
+            unsafe {  
+                let norm_sts = core::ptr::read_volatile(  
+                    (base + 0x30) as *const u16  
+                );  
+                let err_sts = core::ptr::read_volatile(  
+                    (base + 0x32) as *const u16  
+                );  
+                let sig_en = core::ptr::read_volatile(  
+                    (base + 0x38) as *const u16  
+                );  
+                log::info!("  SDHCI NORM_INT_STS: 0x{:04x}", norm_sts);  
+                log::info!("  SDHCI ERR_INT_STS:  0x{:04x}", err_sts);  
+                log::info!("  SDHCI NORM_SIG_EN:  0x{:04x}", sig_en);  
+            }  
+        }  
+        log::info!("======================");  
+    }  
 }
 
 /// 全局 WifiBus 引用（init 后设置，ISR 读取）
@@ -165,10 +203,16 @@ pub fn clear_global_bus() {
     }
 }
 
+use core::sync::atomic::AtomicU64;  
+pub(crate) static IRQ_COUNT: AtomicU64 = AtomicU64::new(0); 
+
 /// PLIC IRQ #38 处理函数
 ///
 /// 约束：不持锁、不分配堆、不调度。仅操作 Atomic + MMIO 裸写 + waker.wake()
 pub fn sdio1_irq_handler() {
+    let cnt = IRQ_COUNT.fetch_add(1, Ordering::Relaxed);  
+    log::info!("[ISR] SDIO1 IRQ#38 triggered (count={})", cnt + 1);   
+
     let Some(bus) = get_global_bus() else {
         return;
     };
@@ -190,48 +234,48 @@ pub fn sdio1_irq_handler() {
         bus.rx_irq_pollset.wake();
     }
 
-    // CMD_CMPL (bit 0)
-    if status & (NORM_INT_CMD_COMPLETE as u32) != 0 {
-        bus.sdhci_cmd_complete.store(true, Ordering::Release);
-    }
+    // // CMD_CMPL (bit 0)
+    // if status & (NORM_INT_CMD_COMPLETE as u32) != 0 {
+    //     bus.sdhci_cmd_complete.store(true, Ordering::Release);
+    // }
 
-    // XFER_CMPL (bit 1)
-    if status & (NORM_INT_XFER_COMPLETE as u32) != 0 {
-        bus.sdhci_xfer_complete.store(true, Ordering::Release);
-    }
+    // // XFER_CMPL (bit 1)
+    // if status & (NORM_INT_XFER_COMPLETE as u32) != 0 {
+    //     bus.sdhci_xfer_complete.store(true, Ordering::Release);
+    // }
 
-    // BUF_RD_READY (bit 5)
-    if status & (NORM_INT_BUF_RD_READY as u32) != 0 {
-        bus.sdhci_buf_rd_ready.store(true, Ordering::Release);
-    }
+    // // BUF_RD_READY (bit 5)
+    // if status & (NORM_INT_BUF_RD_READY as u32) != 0 {
+    //     bus.sdhci_buf_rd_ready.store(true, Ordering::Release);
+    // }
 
-    // ERR_INT (bit 15)
-    if status & (NORM_INT_ERROR as u32) != 0 {
-        let err = unsafe {
-            read_volatile((base + SDHCI_INT_STATUS_ERR as usize) as *const u16)
-        };
-        bus.sdhci_error_status.store(err, Ordering::Release);
-        // W1C 清除 ERR_INT_STS  
-        unsafe {
-            write_volatile(
-                (base + SDHCI_INT_STATUS_ERR as usize) as *mut u16, 
-                err,
-            );
-        }
-    }
-    // W1C 清除所有非 CARD_INT 的 Normal 状态位
-    //   CARD_INT 是电平触发，不能通过 W1C 清除，只能通过 mask 屏蔽 
-    let w1c_mask = (status & !(NORM_INT_CARD_INT as u32)) as u16;  
-    if w1c_mask != 0 {  
-        unsafe {  
-            write_volatile(  
-                (base + SDHCI_INT_STATUS_NORM as usize) as *mut u16,  
-                w1c_mask  
-            );  
-        }  
-    }  
-    // 唤醒 SDHCI 等待者（CMD/XFER/BUF_RD/ERR 共用）  
-    if w1c_mask != 0 {
-        bus.sdhci_pollset.wake();
-    }
+    // // ERR_INT (bit 15)
+    // if status & (NORM_INT_ERROR as u32) != 0 {
+    //     let err = unsafe {
+    //         read_volatile((base + SDHCI_INT_STATUS_ERR as usize) as *const u16)
+    //     };
+    //     bus.sdhci_error_status.store(err, Ordering::Release);
+    //     // W1C 清除 ERR_INT_STS  
+    //     unsafe {
+    //         write_volatile(
+    //             (base + SDHCI_INT_STATUS_ERR as usize) as *mut u16, 
+    //             err,
+    //         );
+    //     }
+    // }
+    // // W1C 清除所有非 CARD_INT 的 Normal 状态位
+    // //   CARD_INT 是电平触发，不能通过 W1C 清除，只能通过 mask 屏蔽 
+    // let w1c_mask = (status & !(NORM_INT_CARD_INT as u32)) as u16;  
+    // if w1c_mask != 0 {  
+    //     unsafe {  
+    //         write_volatile(  
+    //             (base + SDHCI_INT_STATUS_NORM as usize) as *mut u16,  
+    //             w1c_mask  
+    //         );  
+    //     }  
+    // }  
+    // // 唤醒 SDHCI 等待者（CMD/XFER/BUF_RD/ERR 共用）  
+    // if w1c_mask != 0 {
+    //     bus.sdhci_pollset.wake();
+    // }
 }

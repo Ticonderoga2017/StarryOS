@@ -122,6 +122,10 @@ pub fn init_aic8801_firmware<H: SdioHost>(
 
     aicwifi_sys_config(transport)?;
 
+    // 降低时钟到 400kHz（固件启动过渡期 SDIO 不稳定）  
+    log::info!("[aic8800] lowering SDIO clock for start_app...");  
+    transport.host().set_clock(400_000)?; 
+
     // 5. 启动固件(start_from_bootrom) 
     let status = ipc_start_app(
         transport, 
@@ -130,6 +134,10 @@ pub fn init_aic8801_firmware<H: SdioHost>(
     )?;
     log::info!("[aic8800] start_app status = 0x{:08x}", status);  
   
+  // 恢复时钟到 25MHz  
+    transport.host().set_clock(25_000_000)?;  
+    log::info!("[aic8800] SDIO clock restored to 25MHz");
+
     log::info!("[aic8800] === AIC8801 init done ===");  
     Ok(())
 }

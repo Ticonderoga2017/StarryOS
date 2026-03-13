@@ -65,7 +65,7 @@ fn sdio1_probe() {
     use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
     use alloc::sync::Arc;
     use axsync::Mutex;
-    use wireless::aic8800_fdrv::bus::{BusState, WifiBus};
+    use aic8800_fdrv::bus::{BusState, WifiBus};
   
    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
@@ -91,7 +91,25 @@ fn sdio1_probe() {
             }  
   
             match aic8800_fw::firmware_init(&mut sdio1, chip) {  
-                Ok(()) => info!("AIC8800 firmware init SUCCESS"),  
+                Ok(()) => {
+                    info!("AIC8800 firmware init SUCCESS");
+                    // ---- FDRV 初始化 ----  
+                    match aic8800_fdrv::init(sdio1) {  
+                        Ok(bus) => {  
+                            info!("AIC8800 FDRV init SUCCESS");  
+                            // 阶段 4 验证: 发送 MM_VERSION_REQ  
+                            match aic8800_fdrv::cmd_mgr::send_cmd(  
+                                &bus, 0x0004, 0x0000, &[], 6000  
+                            ) {  
+                                Ok(rsp) => info!("[VERIFY-4] MM_VERSION_CFM OK, len={}", rsp.len()),  
+                                Err(e) => error!("[VERIFY-4] MM_VERSION_REQ FAILED: {:?}", e),  
+                            }  
+                            bus.dump_status(); // 打印完整状态  
+                            core::mem::forget(bus); // 临时 leak  
+                        }  
+                        Err(e) => error!("FDRV init FAILED: {}", e),  
+                    }  
+                } 
                 Err(e) => error!("AIC8800 firmware init FAILED: {:?}", e),  
             } 
         }  
