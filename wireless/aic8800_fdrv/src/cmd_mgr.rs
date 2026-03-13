@@ -8,109 +8,8 @@ use core::task::Poll;
 use axtask::future::block_on;
 use log;
 
-use crate::bus::{BusState, WifiBus};
+use crate::{bus::{BusState, WifiBus}, lmac_msg::*};
 use sdhci_cv1800::regs::*; 
-
-// Task IDs（对应 Linux lmac_msg.h — FDRV 版本，含 TASK_TDLS）  
-pub const TASK_MM: u16 = 0;  
-pub const TASK_DBG: u16 = 1;  
-pub const TASK_SCAN: u16 = 2;  
-pub const TASK_TDLS: u16 = 3;  
-pub const TASK_SCANU: u16 = 4;  
-pub const TASK_ME: u16 = 5;  
-pub const TASK_SM: u16 = 6;  
-pub const TASK_APM: u16 = 7;  
-pub const TASK_BAM: u16 = 8;  
-pub const TASK_MESH: u16 = 9;  
-pub const TASK_RXU: u16 = 10;  
-pub const TASK_RM: u16 = 11;  
-pub const TASK_TWT: u16 = 12;  
-pub const TASK_API: u16 = 13;  
-  
-/// Linux 驱动中所有 rwnx_msg_zalloc 调用使用 DRV_TASK_ID = 100 作为 src_id  
-pub const DRV_TASK_ID: u16 = 100;  
-  
-/// CMD 超时（与 Linux RWNX_80211_CMD_TIMEOUT_MS 一致）  
-const CMD_TIMEOUT_MS: u64 = 6000;  
-  
-// Frame construction constants  
-pub const DUMMY_WORD_LEN: usize = 4;  
-pub const TAIL_LEN: usize = 4;  
-pub const CMD_TX_TIMEOUT_DEFAULT_MS: u64 = 5000;  
-
-/// LMAC 消息头（对应 Linux struct lmac_msg）
-#[repr(C)]
-#[derive(Clone, Debug)]
-pub struct LmacMsg {
-    pub id: u16,
-    pub dest_id: u16,
-    pub src_id: u16,
-    pub param_len: u16,
-    pub pattern: u32, 
-}
-
-impl LmacMsg {
-    pub const SIZE: usize = 12;
-
-    /// 从字节切片解析 LmacMsg（小端序） 
-    pub fn from_le_bytes(data: &[u8]) -> Self {
-        Self { 
-            id: u16::from_le_bytes([data[0], data[1]]),
-            dest_id: u16::from_le_bytes([data[2], data[3]]), 
-            src_id: u16::from_le_bytes([data[4], data[5]]), 
-            param_len: u16::from_le_bytes([data[6], data[7]]), 
-            pattern: u32::from_le_bytes([data[8], data[9], data[10], data[11]]), 
-        }
-    }
-
-    /// 序列化为 8 字节小端序 
-    pub fn to_le_bytes(&self) -> [u8; 8] {
-        let mut buf = [0u8; 8];  
-        buf[0..2].copy_from_slice(&self.id.to_le_bytes());  
-        buf[2..4].copy_from_slice(&self.dest_id.to_le_bytes());  
-        buf[4..6].copy_from_slice(&self.src_id.to_le_bytes());  
-        buf[6..8].copy_from_slice(&self.param_len.to_le_bytes());  
-        buf 
-    }
-}
-
-/// MSG_T(task, idx) = (task << 8) | idx  
-pub const fn msg_t(task: u16, idx: u8) -> u16 {  
-    (task << 8) | (idx as u16)  
-}
-
-/// 构造宏：LMAC_FIRST_MSG(task) = (task << 10)
-pub const fn lmac_first_msg(task: u16) -> u16 {
-    task << 10
-}
-
-/// 从 msg_id 提取 message index: bits[9..0]  
-pub const fn msg_index(msg_id: u16) -> u16 {  
-    msg_id & ((1 << 10) - 1)  
-} 
-
-// ============================================================  
-// LMAC 消息 ID（TASK_MM = 0, LMAC_FIRST_MSG(0) = 0）  
-// ============================================================  
-pub const MM_SET_STACK_START_REQ: u16 = 0x007B; // 枚举偏移 123  
-pub const MM_SET_STACK_START_CFM: u16 = 0x007C;  
-
-// MM 消息 (TASK_MM = 0)  
-pub const MM_RESET_REQ: u16           = lmac_first_msg(TASK_MM);      // 0x0000  
-pub const MM_RESET_CFM: u16           = lmac_first_msg(TASK_MM) + 1;  // 0x0001  
-pub const MM_START_REQ: u16           = lmac_first_msg(TASK_MM) + 2;  // 0x0002  
-pub const MM_START_CFM: u16           = lmac_first_msg(TASK_MM) + 3;  // 0x0003  
-pub const MM_VERSION_REQ: u16         = lmac_first_msg(TASK_MM) + 4;  // 0x0004  
-pub const MM_VERSION_CFM: u16         = lmac_first_msg(TASK_MM) + 5;  // 0x0005
-
-#[derive(Debug)]
-pub enum CmdError {
-    Timeout,
-    BusDown, 
-    SdioError, 
-    InvalidResponse,
-    MismatchedCfm { expected: u16, got: u16 },
-}
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -182,10 +81,14 @@ pub fn send_cmd(
     param: &[u8],
     timeout_ms: u64
 ) -> Result<Vec<u8>, CmdError> {
+    log::info!("[cmd_mgr] send_cmd enter: msg_id=0x{:04x}", msg_id);
+
     // 检查总线状态  
     if *bus.state.lock() == BusState::Down {
         return Err(CmdError::BusDown);
     }
+
+    log::info!("[cmd_mgr] state check passed");
 
     let timeout = if timeout_ms == 0 {
         CMD_TX_TIMEOUT_DEFAULT_MS
@@ -195,6 +98,8 @@ pub fn send_cmd(
 
     // ---- 构造 SDIO 帧 ----
     let frame = build_cmd_frame(msg_id, dest_id, param);
+
+    log::info!("[cmd_mgr] frame built, len={}", frame.len());
 
     // 期望的 CFM ID = REQ ID + 1（LMAC 约定） 
     let expected_cfm_id = msg_id + 1;
@@ -339,4 +244,286 @@ pub fn send_cmd_no_cfm(
     bus.tx_wake_pollset.wake();
 
     Ok(())
+}
+
+// ================================================================
+// 1. TX Power Index (AIC8801 默认值)
+// ================================================================
+
+/// 发送 MM_SET_TXPWR_IDX_LVL_REQ
+pub fn send_txpwr_idx_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64,
+) -> Result<(), CmdError> {
+    // txpwr_idx_conf_t: 10 bytes
+    // [enable, dsss, ofdmlowrate_2g4, ofdm64qam_2g4, ofdm256qam_2g4,
+    //  ofdm1024qam_2g4, ofdmlowrate_5g, ofdm64qam_5g, ofdm256qam_5g, ofdm1024qam_5g]
+    let param: [u8; 10] = [
+        1,   // enable
+        9,   // dsss
+        8,   // ofdmlowrate_2g4
+        8,   // ofdm64qam_2g4
+        8,   // ofdm256qam_2g4
+        8,   // ofdm1024qam_2g4
+        11,  // ofdmlowrate_5g
+        10,  // ofdm64qam_5g
+        9,   // ofdm256qam_5g
+        9,   // ofdm1024qam_5g
+    ];
+    log::info!("[lmac] sending MM_SET_TXPWR_IDX_LVL_REQ");
+    send_cmd(bus, MM_SET_TXPWR_IDX_LVL_REQ, TASK_MM, &param, timeout_ms)?;
+    Ok(())
+}
+
+// ================================================================
+// 2. TX Power Offset
+// ================================================================
+
+/// 发送 MM_SET_TXPWR_OFST_REQ
+pub fn send_txpwr_ofst_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64,
+) -> Result<(), CmdError> {
+    // txpwr_ofst_conf_t: 8 bytes
+    // [enable, chan_1_4, chan_5_9, chan_10_13, chan_36_64, chan_100_120, chan_122_140, chan_142_165]
+    let param: [u8; 8] = [
+        1,  // enable
+        0,  // chan_1_4
+        0,  // chan_5_9
+        0,  // chan_10_13
+        0,  // chan_36_64
+        0,  // chan_100_120
+        0,  // chan_122_140
+        0,  // chan_142_165
+    ];
+    log::info!("[lmac] sending MM_SET_TXPWR_OFST_REQ");
+    send_cmd(bus, MM_SET_TXPWR_OFST_REQ, TASK_MM, &param, timeout_ms)?;
+    Ok(())
+}
+
+// ================================================================
+// 3. RF Calibration
+// ================================================================
+
+/// 发送 MM_SET_RF_CALIB_REQ (AIC8801 版本，非 v2)
+pub fn send_rf_calib_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64
+) -> Result<Vec<u8>, CmdError> {
+    // mm_set_rf_calib_req 结构体 (AIC8801):
+    // [0..4]   cal_cfg_24g   (u32 LE) = 0xbf
+    // [4..8]   cal_cfg_5g    (u32 LE) = 0x3f
+    // [8..12]  param_alpha   (u32 LE) = 0x0c34c008
+    // [12..16] bt_calib_en   (u32 LE) = 0
+    // [16..20] bt_calib_param(u32 LE) = 0x264203
+    // [20]     xtal_cap      (u8)     = 0
+    // [21]     xtal_cap_fine (u8)     = 0
+    // 总计 22 字节
+
+    let mut param = [0u8; 22];
+    param[0..4].copy_from_slice(&0x000000bfu32.to_le_bytes());   // cal_cfg_24g
+    param[4..8].copy_from_slice(&0x0000003fu32.to_le_bytes());   // cal_cfg_5g
+    param[8..12].copy_from_slice(&0x0c34c008u32.to_le_bytes());  // param_alpha
+    param[12..16].copy_from_slice(&0u32.to_le_bytes());          // bt_calib_en
+    param[16..20].copy_from_slice(&0x00264203u32.to_le_bytes()); // bt_calib_param
+    param[20] = 0; // xtal_cap
+    param[21] = 0; // xtal_cap_fine
+
+    log::info!("[lmac] sending MM_SET_RF_CALIB_REQ");
+    let rsp = send_cmd(bus, MM_SET_RF_CALIB_REQ, TASK_MM, &param, timeout_ms)?;
+    // CFM: mm_set_rf_calib_cfm = 4 x u32 (rxgain_24g_addr, rxgain_5g_addr, txgain_24g_addr, txgain_5g_addr)
+    if rsp.len() >= 16 {
+        let rxgain_24g = u32::from_le_bytes([rsp[0], rsp[1], rsp[2], rsp[3]]);
+        let txgain_24g = u32::from_le_bytes([rsp[8], rsp[9], rsp[10], rsp[11]]);
+        log::info!("[lmac] RF calib OK: rxgain_24g=0x{:08x}, txgain_24g=0x{:08x}", rxgain_24g, txgain_24g);
+    }
+    Ok(rsp)
+}
+
+// ================================================================
+// 4. ME_CONFIG_REQ — 最小 HT 配置
+// ================================================================
+
+/// 发送 ME_CONFIG_REQ（最小配置：HT only, 20MHz, 1SS）
+/// 对应 Linux: rwnx_send_me_config_req (line 2566-2688)
+///
+/// me_config_req 结构体布局:
+///   struct mac_htcapability ht_cap;    // 32 bytes
+///   struct mac_vhtcapability vht_cap;  // 12 bytes
+///   struct mac_hecapability he_cap;    // 52 bytes (估算)
+///   u16 tx_lft;
+///   u8  phy_bw_max;
+///   bool ht_supp;
+///   bool vht_supp;
+///   bool he_supp;
+///   bool he_ul_on;
+///   bool ps_on;
+///   bool ant_div_on;
+///   bool dpsm;
+///
+/// 最小移植策略：全部填零，只设置关键字段
+pub fn send_me_config_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, CmdError> {
+    // mac_htcapability:  26 bytes (2+1+16+2+4+1)  
+    // mac_vhtcapability: 12 bytes (4+2+2+2+2)  
+    // mac_hecapability:  54 bytes (6+11+12+25)  
+    // tail fields:       10 bytes (2+1+1+1+1+1+1+1+1)  
+    // 总计: 102 bytes  
+
+    const HT_CAP_SIZE: usize = 26;  
+    const VHT_CAP_SIZE: usize = 12;  
+    const HE_CAP_SIZE: usize = 54;  
+    const ME_CONFIG_SIZE: usize = HT_CAP_SIZE + VHT_CAP_SIZE + HE_CAP_SIZE + 10; // 102  
+  
+    let mut param = [0u8; ME_CONFIG_SIZE];  
+
+    // ht_cap (offset 0)  
+    param[0..2].copy_from_slice(&0x0001u16.to_le_bytes()); // ht_capa_info = LDPC  
+    param[2] = 3 | (7 << 2); // a_mpdu_param  
+    param[3] = 0xFF; // mcs_rate[0]  
+  
+    // vht_cap (offset 26) — 全零  
+    // he_cap  (offset 38) — 全零  
+  
+    let tail = HT_CAP_SIZE + VHT_CAP_SIZE + HE_CAP_SIZE; // 92  
+    // tx_lft (u16) = 0  
+    // phy_bw_max (u8) = 0  
+    param[tail + 2] = 0; // PHY_CHNL_BW_20  
+    // ht_supp = 1  
+    param[tail + 3] = 1;  
+    // vht_supp..dpsm = 0  
+  
+    log::info!("[lmac] sending ME_CONFIG_REQ (HT only, 20MHz, 1SS)");  
+    send_cmd(bus, ME_CONFIG_REQ, TASK_ME, &param, timeout_ms)  
+}
+
+/// 发送 ME_CHAN_CONFIG_REQ（2.4GHz 信道 1-14）
+///
+/// me_chan_config_req 结构体:
+///   mac_chan_def chan2G4[14];  // 14 * 4 bytes = 56 bytes
+///   mac_chan_def chan5G[28];   // 28 * 4 bytes = 112 bytes
+///   u8 chan2G4_cnt;
+///   u8 chan5G_cnt;
+///
+/// mac_chan_def:
+///   u16 freq;      // MHz
+///   u8  band;      // 0 = 2.4GHz
+///   u8  flags;     // 0 = enabled
+///   s8  tx_power;  // dBm (Linux 用 30 dBm)
+///   → 实际 5 bytes，但可能有 padding → 按 Linux 对齐
+///
+/// 注意：mac_chan_def 在 Linux 中是 5 字节 + padding
+/// 实际布局需要与固件匹配
+pub fn send_me_chan_config_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64
+) -> Result<Vec<u8>, CmdError> {
+    // mac_chan_def 大小: freq(2) + band(1) + flags(1) + tx_power(1) = 5 bytes
+    // 假设无 padding = 5 bytes per entry
+    const CHAN_DEF_SIZE: usize = 5; // mac_chan_def 大小
+    const MAX_2G4: usize = 14;
+    const MAX_5G: usize = 28;
+
+    // 总大小 = 14*5 + 28*5 + 1 + 1 = 70 + 140 + 2 = 212
+    let total_size = MAX_2G4 * CHAN_DEF_SIZE + MAX_5G * CHAN_DEF_SIZE + 2;
+    let mut param = alloc::vec![0u8; total_size];
+
+    // 填充 chan2G4[0..14]
+    let chan_cnt = CHAN_2G4_FREQS.len().min(MAX_2G4);
+    for i in 0..chan_cnt {
+        let off = i * CHAN_DEF_SIZE;
+        param[off..off + 2].copy_from_slice(&CHAN_2G4_FREQS[i].to_le_bytes()); // freq
+        param[off + 2] = 0; // band = NL80211_BAND_2GHZ
+        param[off + 3] = 0; // flags = 0 (enabled)
+        param[off + 4] = 30; // tx_power = 30 dBm (与 Linux 一致)
+    }
+    
+    // chan5G[0..28] 全零（不使用 5GHz）
+
+    // chan2G4_cnt 和 chan5G_cnt 在尾部
+    let cnt_offset = MAX_2G4 * CHAN_DEF_SIZE + MAX_5G * CHAN_DEF_SIZE;
+    param[cnt_offset] = chan_cnt as u8;     // chan2G4_cnt
+    param[cnt_offset + 1] = 0;             // chan5G_cnt
+
+    log::info!("[lmac] sending ME_CHAN_CONFIG_REQ ({} 2.4GHz channels)", chan_cnt);
+    send_cmd(bus, ME_CHAN_CONFIG_REQ, TASK_ME, &param, timeout_ms)
+}
+
+// ================================================================
+// 6. MM_START_REQ — 启动 MAC
+// ================================================================
+
+/// 发送 MM_START_REQ
+/// 对应 Linux: rwnx_send_start (line 473-492)
+///
+/// mm_start_req 结构体:
+///   phy_cfg_tag phy_cfg;     // 16 * u32 = 64 bytes (全零即可)
+///   u32 uapsd_timeout;       // 300 (Linux 默认)
+///   u16 lp_clk_accuracy;     // 20 ppm (Linux 默认)
+pub fn send_mm_start_req(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64
+) -> Result<Vec<u8>, CmdError> {
+    // phy_cfg: 16 * 4 = 64 bytes (全零 — AIC8801 不需要 PHY 配置)
+    // uapsd_timeout: 4 bytes
+    // lp_clk_accuracy: 2 bytes
+    // 总计 70 bytes
+
+    let mut param = [0u8; 70];
+    // phy_cfg[0..64] = 全零
+    // uapsd_timeout = 300 (Linux 默认值)
+    param[64..68].copy_from_slice(&300u32.to_le_bytes());
+    // lp_clk_accuracy = 20 ppm
+    param[68..70].copy_from_slice(&20u16.to_le_bytes());
+
+    log::info!("[lmac] sending MM_START_REQ");
+    send_cmd(bus, MM_START_REQ, TASK_MM, &param, timeout_ms)
+}
+
+/// 发送 MM_ADD_IF_REQ（创建 STA 接口）
+/// 对应 Linux: rwnx_send_add_if (line 508-562)
+///
+/// mm_add_if_req 结构体:
+///   u8 type;           // MM_STA = 0
+///   mac_addr addr;     // 6 bytes (struct mac_addr { u16 array[3]; })
+///   bool p2p;          // false
+///
+/// 返回 CFM 中的 vif_index (mm_add_if_cfm.inst_nbr)
+pub fn send_mm_add_if_req(
+    bus: &Arc<WifiBus>,
+    mac_addr: &[u8; 6],
+    timeout_ms: u64
+) -> Result<u8, CmdError> {
+    // mm_add_if_req: type(1) + addr(6) + p2p(1) = 8 bytes
+    let mut param = [0u8; 8];
+    param[0] = MM_STA;                    // type = STA
+    param[1..7].copy_from_slice(mac_addr); // MAC address
+    param[7] = 0;                          // p2p = false
+
+    log::info!(
+        "[lmac] sending MM_ADD_IF_REQ (STA, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+        mac_addr[0], mac_addr[1], mac_addr[2],
+        mac_addr[3], mac_addr[4], mac_addr[5]
+    );
+
+    let rsp = send_cmd(bus, MM_ADD_IF_REQ, TASK_MM, &param, timeout_ms)?;
+
+    // mm_add_if_cfm:
+    //   u8 status;     // 0 = success
+    //   u8 inst_nbr;   // VIF index
+    if rsp.len() >= 2 {
+        let status = rsp[0];
+        let vif_idx = rsp[1];
+        if status != 0 {
+            log::error!("[lmac] MM_ADD_IF_CFM status={} (error)", status);
+            return Err(CmdError::FirmwareError);
+        }
+        log::info!("[lmac] MM_ADD_IF_CFM OK: vif_index={}", vif_idx);
+        Ok(vif_idx)
+    } else {
+        log::error!("[lmac] MM_ADD_IF_CFM too short: {} bytes", rsp.len());
+        Err(CmdError::InvalidResponse)
+    }
 }

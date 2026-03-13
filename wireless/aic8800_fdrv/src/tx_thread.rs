@@ -2,6 +2,7 @@ use aic8800_sdio::SdioHost;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::vec;
+use core::ptr::{read_volatile, write_volatile};
 use core::{future::poll_fn, sync::atomic::Ordering};
 use core::task::Poll;
 
@@ -139,9 +140,11 @@ fn tx_process(bus: &WifiBus) -> bool {
 
             if fc_ok {
                 let sdio = bus.sdio.lock();
+                log::info!("[wifi-tx] calling write_fifo...");  
                 if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &cmd) {
                     log::error!("[wifi-tx] CMD write_fifo failed: {:?}", e); 
                 } else {
+                    log::info!("[wifi-tx] CMD write_fifo OK"); 
                     did_work = true;
                     // 发送后 unmask CARD_INT，让芯片回复的 CFM 能触发 ISR  
                     let base = bus.sdio_mmio_base.load(Ordering::Acquire);  

@@ -66,6 +66,7 @@ fn sdio1_probe() {
     use alloc::sync::Arc;
     use axsync::Mutex;
     use aic8800_fdrv::bus::{BusState, WifiBus};
+    use aic8800_fdrv::cmd_mgr::*;
   
    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
@@ -104,8 +105,58 @@ fn sdio1_probe() {
                                 Ok(rsp) => info!("[VERIFY-4] MM_VERSION_CFM OK, len={}", rsp.len()),  
                                 Err(e) => error!("[VERIFY-4] MM_VERSION_REQ FAILED: {:?}", e),  
                             }  
+
+                            // ========== Phase: LMAC Configuration ==========
+                            info!("========== LMAC Config Start ==========");
+                            
+                            // 1. TX Power Index
+                            match send_txpwr_idx_req(&bus, 6000) {
+                                Ok(_) => info!("[LMAC] txpwr_idx OK"),
+                                Err(e) => error!("[LMAC] txpwr_idx FAILED: {:?}", e),
+                            }
+
+                            // 2. TX Power Offset
+                            match send_txpwr_ofst_req(&bus, 6000) {
+                                Ok(_) => info!("[LMAC] txpwr_ofst OK"),
+                                Err(e) => error!("[LMAC] txpwr_ofst FAILED: {:?}", e),
+                            }
+
+                            // 3. RF Calibration
+                            match send_rf_calib_req(&bus, 10000) {
+                                Ok(_) => info!("[LMAC] rf_calib OK"),
+                                Err(e) => error!("[LMAC] rf_calib FAILED: {:?}", e),
+                            }
+
+                            // 4. ME Config (HT capabilities)
+                            match send_me_config_req(&bus, 6000) {
+                                Ok(_) => info!("[LMAC] me_config OK"),
+                                Err(e) => error!("[LMAC] me_config FAILED: {:?}", e),
+                            }
+
+                            // 5. ME Channel Config (2.4GHz channels)
+                            match send_me_chan_config_req(&bus, 6000) {
+                                Ok(_) => info!("[LMAC] me_chan_config OK"),
+                                Err(e) => error!("[LMAC] me_chan_config FAILED: {:?}", e),
+                            }
+
+                            // 6. MM_START (启动 MAC)
+                            match send_mm_start_req(&bus, 6000) {
+                                Ok(_) => info!("[LMAC] mm_start OK"),
+                                Err(e) => error!("[LMAC] mm_start FAILED: {:?}", e),
+                            }
+
+                            // 7. MM_ADD_IF (创建 STA VIF)
+                            // 使用固定 MAC 地址（可从 MM_GET_MAC_ADDR_REQ 获取）
+                            let mac_addr: [u8; 6] = [0x88, 0x00, 0x33, 0x88, 0x00, 0x01];
+                            match send_mm_add_if_req(&bus, &mac_addr, 6000) {
+                                Ok(vif_idx) => info!("[LMAC] add_if OK: vif_index={}", vif_idx),
+                                Err(e) => error!("[LMAC] add_if FAILED: {:?}", e),
+                            }
+
+                            info!("========== LMAC Config End ==========");
+
                             bus.dump_status(); // 打印完整状态  
-                            core::mem::forget(bus); // 临时 leak  
+                            core::mem::forget(bus); // 临时 leak                              
                         }  
                         Err(e) => error!("FDRV init FAILED: {}", e),  
                     }  

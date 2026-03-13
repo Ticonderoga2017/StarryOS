@@ -4,7 +4,7 @@ use axpoll::PollSet;
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use sdhci_cv1800::{CviSdhci, mask_unmask_card_irq_raw, regs::*};
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::read_volatile;
 use aic8800_sdio::SdioHost;
 
 /// 总线状态
@@ -210,8 +210,10 @@ pub(crate) static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 ///
 /// 约束：不持锁、不分配堆、不调度。仅操作 Atomic + MMIO 裸写 + waker.wake()
 pub fn sdio1_irq_handler() {
-    let cnt = IRQ_COUNT.fetch_add(1, Ordering::Relaxed);  
-    log::info!("[ISR] SDIO1 IRQ#38 triggered (count={})", cnt + 1);   
+    IRQ_COUNT.fetch_add(1, Ordering::Relaxed);  
+    // 注意：ISR 中禁止调用 log::info!/warn!/error!  
+    // 这些宏需要获取 console 锁，如果被打断的代码持有该锁会死锁
+    // log::info!("[ISR] SDIO1 IRQ#38 triggered (count={})", cnt + 1);   
 
     let Some(bus) = get_global_bus() else {
         return;
@@ -233,49 +235,4 @@ pub fn sdio1_irq_handler() {
         // 唤醒 wifi-rx 线程
         bus.rx_irq_pollset.wake();
     }
-
-    // // CMD_CMPL (bit 0)
-    // if status & (NORM_INT_CMD_COMPLETE as u32) != 0 {
-    //     bus.sdhci_cmd_complete.store(true, Ordering::Release);
-    // }
-
-    // // XFER_CMPL (bit 1)
-    // if status & (NORM_INT_XFER_COMPLETE as u32) != 0 {
-    //     bus.sdhci_xfer_complete.store(true, Ordering::Release);
-    // }
-
-    // // BUF_RD_READY (bit 5)
-    // if status & (NORM_INT_BUF_RD_READY as u32) != 0 {
-    //     bus.sdhci_buf_rd_ready.store(true, Ordering::Release);
-    // }
-
-    // // ERR_INT (bit 15)
-    // if status & (NORM_INT_ERROR as u32) != 0 {
-    //     let err = unsafe {
-    //         read_volatile((base + SDHCI_INT_STATUS_ERR as usize) as *const u16)
-    //     };
-    //     bus.sdhci_error_status.store(err, Ordering::Release);
-    //     // W1C 清除 ERR_INT_STS  
-    //     unsafe {
-    //         write_volatile(
-    //             (base + SDHCI_INT_STATUS_ERR as usize) as *mut u16, 
-    //             err,
-    //         );
-    //     }
-    // }
-    // // W1C 清除所有非 CARD_INT 的 Normal 状态位
-    // //   CARD_INT 是电平触发，不能通过 W1C 清除，只能通过 mask 屏蔽 
-    // let w1c_mask = (status & !(NORM_INT_CARD_INT as u32)) as u16;  
-    // if w1c_mask != 0 {  
-    //     unsafe {  
-    //         write_volatile(  
-    //             (base + SDHCI_INT_STATUS_NORM as usize) as *mut u16,  
-    //             w1c_mask  
-    //         );  
-    //     }  
-    // }  
-    // // 唤醒 SDHCI 等待者（CMD/XFER/BUF_RD/ERR 共用）  
-    // if w1c_mask != 0 {
-    //     bus.sdhci_pollset.wake();
-    // }
 }

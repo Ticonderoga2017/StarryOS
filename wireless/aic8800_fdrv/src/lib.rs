@@ -4,6 +4,9 @@ pub mod bus;
 pub mod cmd_mgr;
 pub mod rx_thread;
 pub mod tx_thread;
+pub mod lmac_msg;
+pub mod wifi_mgr;
+pub mod wpa2;
 
 extern crate alloc;
   
@@ -12,9 +15,8 @@ use alloc::vec;
 use core::sync::atomic::Ordering;
 use bus::{WifiBus, BusState, set_global_bus, sdio1_irq_handler};  
 use sdhci_cv1800::{CviSdhci, regs::*};  
-use aic8800_sdio::SdioHost;
-
-use crate::cmd_mgr::{DRV_TASK_ID, DUMMY_WORD_LEN, MM_RESET_REQ, MM_SET_STACK_START_REQ, TAIL_LEN, TASK_MM};  
+use aic8800_sdio::SdioHost; 
+use crate::lmac_msg::*; 
 
 /// 轮询模式发送 LMAC 命令并等待 CFM  
 ///  
