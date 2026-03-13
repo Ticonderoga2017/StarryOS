@@ -41,6 +41,7 @@ pub struct WifiBus {
     // ---- RX 侧 ----
     /// RX PollSet：SDIO Card Interrupt → ISR 唤醒 wifi-rx 线程
     pub rx_irq_pollset: PollSet,
+    pub rx_irq_pending: AtomicBool,
 
     /// RX 帧队列（ISR 不写此队列；wifi-rx 线程读 FIFO 后按类型分发）
     /// 数据帧队列（wifi-rx → NetDevice）
@@ -83,6 +84,7 @@ impl WifiBus {
             sdhci_error_status: AtomicU16::new(0),  
             sdhci_pollset: PollSet::new(),  
             rx_irq_pollset: PollSet::new(), 
+            rx_irq_pending: AtomicBool::new(false),
             data_rx_queue: SpinNoIrq::new(VecDeque::new()),
             data_rx_pollset: PollSet::new(),
             cmd_rsp_queue: SpinNoIrq::new(VecDeque::new()), 
@@ -215,9 +217,7 @@ pub fn sdio1_irq_handler() {
     // 这些宏需要获取 console 锁，如果被打断的代码持有该锁会死锁
     // log::info!("[ISR] SDIO1 IRQ#38 triggered (count={})", cnt + 1);   
 
-    let Some(bus) = get_global_bus() else {
-        return;
-    };
+    let Some(bus) = get_global_bus() else { return };
     let base = bus.sdio_mmio_base.load(Ordering::Acquire);
     if base == 0 { return; }
     
@@ -233,6 +233,7 @@ pub fn sdio1_irq_handler() {
         // 屏蔽 CARD_INT 信号，防止重复触发（电平触发）
         mask_unmask_card_irq_raw(base, true);
         // 唤醒 wifi-rx 线程
-        bus.rx_irq_pollset.wake();
+        // bus.rx_irq_pollset.wake();
+        bus.rx_irq_pending.store(true, Ordering::Release);
     }
 }

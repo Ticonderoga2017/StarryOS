@@ -67,6 +67,7 @@ pub fn start(bus: Arc<WifiBus>) {
 
                 // 注册 waker
                 bus.tx_wake_pollset.register(cx.waker());
+
                 // 双重检查
                 if did_work || has_pending_work(&bus) {
                     cx.waker().wake_by_ref();
@@ -100,7 +101,12 @@ fn tx_process(bus: &WifiBus) -> bool {
             bus.cmd_pending_flag.store(false, Ordering::Release);
 
             // 对 CMD 帧做对齐（对应 Linux aicwf_sdio_tx_msg 的 alignment + tail）
-            let send_len = pad_cmd_frame(&mut cmd);            
+            let send_len = pad_cmd_frame(&mut cmd);      
+
+            let base = bus.sdio_mmio_base.load(Ordering::Acquire);
+            if base != 0 {
+                mask_unmask_card_irq_raw(base, true);
+            }      
 
             log::info!("[wifi-tx] CMD frame ready, send_len={}", send_len); 
 
@@ -136,28 +142,42 @@ fn tx_process(bus: &WifiBus) -> bool {
                     for _ in 0..10_000 { core::hint::spin_loop(); }   
                     sdio = bus.sdio.lock();  
                 }
+
+                // flow_ctrl 通过后，在同一个锁内直接 write_fifo  
+                if fc_ok {  
+                    log::info!("[wifi-tx] calling write_fifo...");  
+                    if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &cmd) {  
+                        log::error!("[wifi-tx] CMD write_fifo failed: {:?}", e);  
+                    } else {  
+                        log::info!("[wifi-tx] CMD write_fifo OK");  
+                        did_work = true;  
+                    }  
+                }  
             }
 
-            if fc_ok {
-                let sdio = bus.sdio.lock();
-                log::info!("[wifi-tx] calling write_fifo...");  
-                if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &cmd) {
-                    log::error!("[wifi-tx] CMD write_fifo failed: {:?}", e); 
-                } else {
-                    log::info!("[wifi-tx] CMD write_fifo OK"); 
-                    did_work = true;
-                    // 发送后 unmask CARD_INT，让芯片回复的 CFM 能触发 ISR  
-                    let base = bus.sdio_mmio_base.load(Ordering::Acquire);  
-                    if base != 0 {  
-                        mask_unmask_card_irq_raw(base, false);  
-                    }  
-                    bus.rx_irq_pollset.wake(); 
+            if fc_ok && did_work {
+                // 先 wake RX 线程（CARD_INT 仍然 masked，ISR 不会触发，  
+                //   wake() 内部的 log::info! 不会被 ISR 打断） 
+                bus.rx_irq_pollset.wake();
+
+                // 最后才 unmask CARD_INT  
+                //   此后不再有任何 log 调用，ISR 触发后只设 flag 不调 wake() 
+                if base != 0 {
+                    mask_unmask_card_irq_raw(base, false);
                 }
-            } else {
+            } else if !fc_ok {
                 log::error!("[wifi-tx] CMD flow_ctrl timeout, dropping CMD");  
-                // 通知 CmdMgr 发送失败  
-                bus.cmd_rsp_error.store(true, Ordering::Release);
-                bus.cmd_rsp_pollset.wake();
+                bus.cmd_rsp_error.store(true, Ordering::Release);  
+                bus.cmd_rsp_pollset.wake();  
+                // unmask CARD_INT 恢复原状  
+                if base != 0 {  
+                    mask_unmask_card_irq_raw(base, false);  
+                } 
+            } else {
+                // write_fifo 失败，也要 unmask  
+                if base != 0 {  
+                    mask_unmask_card_irq_raw(base, false);  
+                }
             }
         }
     }

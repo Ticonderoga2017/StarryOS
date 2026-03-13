@@ -35,23 +35,45 @@ pub fn start(bus: Arc<WifiBus>) {
             log::info!("[wifi-rx] thread started");
 
             block_on(poll_fn(move |cx| {
-                let wake_cnt = RX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);  
-                if wake_cnt > 0 {  
-                    log::info!("[wifi-rx] woke up (count={})", wake_cnt);  
-                } 
-
                 // 检查总线状态
                 if *bus.state.lock() == BusState::Down {
                     return Poll::Ready(());
                 }
+
+                // 检查并清除 ISR 标志  
+                if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {
+                    RX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+
+                let cnt = RX_WAKE_COUNT.load(Ordering::Relaxed);
+                if cnt > 0 {  
+                    log::info!("[wifi-rx] woke up (count={})", cnt);  
+                } 
+
                 // 处理所有待读数据
                 process_rx_frames(&bus);
 
                 bus.rx_irq_pollset.register(cx.waker());
 
-                // 二次检查（注册和中断之间可能有数据到达）
-                process_rx_frames(&bus);
+                // 检查 rx_irq_pending 标志  
+                //   如果 ISR 在 process_rx_frames 和 register 之间触发，  
+                //   rx_irq_pending 会被设置，这里捕获它  
+                if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {
+                    // ISR 已触发但没有调用 wake()，手动重新处理  
+                    process_rx_frames(&bus);  
+                    // 重新调度自己，继续检查  
+                    cx.waker().wake_by_ref();  
+                    return Poll::Pending;  
+                }
 
+                // // 二次检查（注册和中断之间可能有数据到达）
+                // process_rx_frames(&bus);
+
+                // if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {
+                //     cx.waker().wake_by_ref();
+                // }
+
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }))
         },
@@ -64,6 +86,11 @@ fn process_rx_frames(bus: &WifiBus) {
     let mut read_any = false;
 
     loop {
+        // 在轮询循环中也检查 rx_irq_pending  
+        if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {  
+            // ISR 触发了，继续读取（不 break）  
+        }
+
         let block_cnt = {
             let sdio = bus.sdio.lock();
             match sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG) {
@@ -85,6 +112,11 @@ fn process_rx_frames(bus: &WifiBus) {
             let mut found = false;
             for poll_i in 0..500u32 {
                 for _ in 0..100u32 { core::hint::spin_loop(); }
+
+                 // 轮询期间也检查 rx_irq_pending  
+                if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {  
+                    // ISR 触发了，重新读 block_cnt  
+                } 
 
                 let cnt = {
                     let sdio = bus.sdio.lock();
