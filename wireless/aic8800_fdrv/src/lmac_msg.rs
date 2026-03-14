@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 /// LMAC 消息头（对应 Linux struct lmac_msg）
 #[repr(C)]
 #[derive(Clone, Debug)]
@@ -49,7 +51,7 @@ pub const fn msg_index(msg_id: u16) -> u16 {
     msg_id & ((1 << 10) - 1)  
 } 
 
-// Task IDs（对应 Linux lmac_msg.h — FDRV 版本，含 TASK_TDLS）  
+// Task IDs
 pub const TASK_MM: u16 = 0;  
 pub const TASK_DBG: u16 = 1;  
 pub const TASK_SCAN: u16 = 2;  
@@ -155,3 +157,245 @@ pub const CHAN_2G4_FREQS: [u16; 14] = [
     2412, 2417, 2422, 2427, 2432, 2437, 2442,
     2447, 2452, 2457, 2462, 2467, 2472, 2484,
 ];
+
+// ========== SCANU messages (TASK_SCANU = 4, base = 0x1000) ==========
+pub const SCANU_START_REQ:           u16 = lmac_first_msg(TASK_SCANU);     // 0x1000
+pub const SCANU_START_CFM:           u16 = lmac_first_msg(TASK_SCANU) + 1; // 0x1001
+pub const SCANU_JOIN_REQ:            u16 = lmac_first_msg(TASK_SCANU) + 2; // 0x1002
+pub const SCANU_JOIN_CFM:            u16 = lmac_first_msg(TASK_SCANU) + 3; // 0x1003
+pub const SCANU_RESULT_IND:          u16 = lmac_first_msg(TASK_SCANU) + 4; // 0x1004
+pub const SCANU_FAST_REQ:            u16 = lmac_first_msg(TASK_SCANU) + 5; // 0x1005
+pub const SCANU_FAST_CFM:            u16 = lmac_first_msg(TASK_SCANU) + 6; // 0x1006
+pub const SCANU_VENDOR_IE_REQ:       u16 = lmac_first_msg(TASK_SCANU) + 7; // 0x1007
+pub const SCANU_VENDOR_IE_CFM:       u16 = lmac_first_msg(TASK_SCANU) + 8; // 0x1008
+pub const SCANU_START_CFM_ADDTIONAL: u16 = lmac_first_msg(TASK_SCANU) + 9; // 0x1009
+pub const SCANU_CANCEL_REQ:          u16 = lmac_first_msg(TASK_SCANU) + 10; // 0x100A
+pub const SCANU_CANCEL_CFM:          u16 = lmac_first_msg(TASK_SCANU) + 11; // 0x100B
+
+// ========== 常量 ==========
+pub const SCAN_SSID_MAX: usize = 3;
+pub const SCAN_CHANNEL_MAX: usize = 42; // MAC_DOMAINCHANNEL_24G_MAX(14) + MAC_DOMAINCHANNEL_5G_MAX(28)
+pub const MAC_SSID_LEN: usize = 32;
+pub const MAC_ADDR_LEN: usize = 6;
+
+/// 从 msg_id 提取 task_id: bits[15..10]
+pub const fn msg_task(id: u16) -> u16 { id >> 10 }
+
+/// mac_chan_def: 5 bytes (freq:u16 + band:u8 + flags:u8 + tx_power:i8)
+pub const MAC_CHAN_DEF_SIZE: usize = 5;
+
+/// mac_ssid: 33 bytes (length:u8 + array:[u8;32])
+pub const MAC_SSID_SIZE: usize = 33;
+
+/// mac_addr: 6 bytes (array:[u16;3], 即 6 字节)
+pub const MAC_ADDR_SIZE: usize = 6;
+
+/// scanu_start_req 总大小:
+///   chan[42] * 5 = 210
+///   ssid[3] * 33 = 99
+///   bssid = 6
+///   add_ies = 4 (u32)
+///   add_ie_len = 2 (u16)
+///   vif_idx = 1
+///   chan_cnt = 1
+///   ssid_cnt = 1
+///   no_cck = 1
+///   duration = 4 (u32)
+///   总计 = 210 + 99 + 6 + 4 + 2 + 1 + 1 + 1 + 1 + 4 = 329
+pub const SCANU_START_REQ_SIZE: usize = MAC_CHAN_DEF_SIZE * SCAN_CHANNEL_MAX
+    + MAC_SSID_SIZE * SCAN_SSID_MAX
+    + MAC_ADDR_SIZE
+    + 4 + 2 + 1 + 1 + 1 + 1 + 4;
+
+/// scanu_start_cfm: 3 bytes (vif_idx:u8 + status:u8 + result_cnt:u8)
+/// scanu_result_ind 头部: 10 bytes (length:u16 + framectrl:u16 + center_freq:u16
+///                                  + band:u8 + sta_idx:u8 + inst_nbr:u8 + rssi:i8)
+///   后跟 payload[] (变长)
+
+/// 扫描结果（从 SCANU_RESULT_IND 解析）
+#[derive(Clone, Debug)]
+pub struct ScanResult {
+    pub ssid: [u8; MAC_SSID_LEN],
+    pub ssid_len: u8,
+    pub bssid: [u8; 6],
+    pub center_freq: u16,
+    pub rssi: i8,
+    pub capability: u16,
+    pub beacon_interval: u16,
+    /// 原始 802.11 管理帧 payload（用于后续 IE 解析）
+    pub raw_payload: Vec<u8>,
+}
+
+// ================================================================  
+// 以下为扫描 + 连接 + 密钥管理 + 断连所需的补充定义  
+// ================================================================  
+  
+// ========== SM messages (TASK_SM = 6, base = 0x1800) ==========  
+pub const SM_CONNECT_REQ:                    u16 = lmac_first_msg(TASK_SM);      // 0x1800  
+pub const SM_CONNECT_CFM:                    u16 = lmac_first_msg(TASK_SM) + 1;  // 0x1801  
+pub const SM_CONNECT_IND:                    u16 = lmac_first_msg(TASK_SM) + 2;  // 0x1802  
+pub const SM_DISCONNECT_REQ:                 u16 = lmac_first_msg(TASK_SM) + 3;  // 0x1803  
+pub const SM_DISCONNECT_CFM:                 u16 = lmac_first_msg(TASK_SM) + 4;  // 0x1804  
+pub const SM_DISCONNECT_IND:                 u16 = lmac_first_msg(TASK_SM) + 5;  // 0x1805  
+pub const SM_EXTERNAL_AUTH_REQUIRED_IND:     u16 = lmac_first_msg(TASK_SM) + 6;  // 0x1806  
+pub const SM_EXTERNAL_AUTH_REQUIRED_RSP:     u16 = lmac_first_msg(TASK_SM) + 7;  // 0x1807  
+pub const SM_FT_AUTH_IND:                    u16 = lmac_first_msg(TASK_SM) + 8;  // 0x1808  
+pub const SM_FT_AUTH_RSP:                    u16 = lmac_first_msg(TASK_SM) + 9;  // 0x1809  
+pub const SM_RSP_TIMEOUT_IND:                u16 = lmac_first_msg(TASK_SM) + 10; // 0x180A  
+pub const SM_COEX_TS_TIMEOUT_IND:            u16 = lmac_first_msg(TASK_SM) + 11; // 0x180B  
+pub const SM_EXTERNAL_AUTH_REQUIRED_RSP_CFM: u16 = lmac_first_msg(TASK_SM) + 12; // 0x180C  
+  
+// ========== MM 密钥管理 (补充 KEY_DEL) ==========  
+pub const MM_KEY_DEL_REQ:            u16 = 0x0026;  
+pub const MM_KEY_DEL_CFM:            u16 = 0x0027;  
+  
+// ========== 连接 flags (mac_connection_flags) ==========  
+/// 控制端口由 host 管理（设置后 EAPOL 帧会透传给驱动）  
+pub const CONTROL_PORT_HOST:  u32 = 1 << 0;  
+/// 控制端口帧不加密  
+pub const CONTROL_PORT_NO_ENC: u32 = 1 << 1;  
+/// 禁用 HT（WEP/TKIP 时需要）  
+pub const DISABLE_HT:         u32 = 1 << 2;  
+/// 使用 WPA/WPA2 认证  
+pub const WPA_WPA2_IN_USE:    u32 = 1 << 3;  
+/// 使用 MFP (802.11w)  
+pub const MFP_IN_USE:         u32 = 1 << 4;  
+/// 重关联（roaming）  
+pub const REASSOCIATION:      u32 = 1 << 5;  
+  
+// ========== 认证类型 ==========  
+pub const WLAN_AUTH_OPEN:       u8 = 0;  
+pub const WLAN_AUTH_SHARED_KEY: u8 = 1;  
+pub const WLAN_AUTH_FT:         u8 = 2;  
+pub const WLAN_AUTH_SAE:        u8 = 3;  
+  
+// ========== Cipher suite (固件内部编号，非 IEEE OUI) ==========  
+pub const MAC_CIPHER_WEP40:   u8 = 0;  
+pub const MAC_CIPHER_TKIP:    u8 = 1;  
+pub const MAC_CIPHER_CCMP:    u8 = 2;  
+pub const MAC_CIPHER_WEP104:  u8 = 3;  
+  
+// ========== mac_sec_key 常量 ==========  
+/// 密钥最大长度（字节）  
+pub const MAC_SEC_KEY_LEN: usize = 32;  
+  
+// ========== 802.11 IE ID ==========  
+pub const WLAN_EID_SSID: u8 = 0;  
+pub const WLAN_EID_RSN:  u8 = 48;  
+  
+// ========== 802.1X EtherType ==========  
+/// 802.1X Authentication (EAPOL) EtherType，网络字节序  
+pub const ETH_P_PAE: u16 = 0x888E;  
+  
+// ========== sm_connect_req 结构体布局常量 ==========  
+//  
+// 参考 Linux: struct sm_connect_req (lmac_msg.h:2406-2432)  
+//   struct mac_ssid ssid;           // 33 bytes (1 + 32)  
+//   struct mac_addr bssid;          // 6 bytes  
+//   struct mac_chan_def chan;        // 5 bytes  
+//   u32 flags;                      // 4 bytes  
+//   u16 ctrl_port_ethertype;        // 2 bytes  
+//   u16 ie_len;                     // 2 bytes  
+//   u16 listen_interval;            // 2 bytes  
+//   bool dont_wait_bcmc;            // 1 byte  
+//   u8 auth_type;                   // 1 byte  
+//   u8 uapsd_queues;               // 1 byte  
+//   u8 vif_idx;                     // 1 byte  
+//   u32 ie_buf[64];                // 256 bytes  
+//  
+// 注意：C 编译器会在字段间插入 padding 以满足对齐要求。  
+// 实际布局需要与固件匹配。以下偏移量基于 ARM/RISC-V 默认对齐规则：  
+//  
+//   offset 0:   ssid.length (u8)  
+//   offset 1:   ssid.array[32]  
+//   offset 33:  padding (1 byte, align bssid to u16)  
+//   offset 34:  bssid (6 bytes, u16[3])  
+//   offset 40:  chan.freq (u16) + chan.band (u8) + chan.flags (u8) + chan.tx_power (i8) = 5 bytes  
+//   offset 45:  padding (1 byte, align flags to u32)  
+//   offset 46:  更多 padding (2 bytes, align to u32)  
+//   ... 实际偏移取决于编译器  
+//  
+// 最安全的做法：使用 sizeof(struct sm_connect_req) 从 Linux 驱动获取确切大小。  
+// sm_connect_req 的 ie_buf 是 u32[64] = 256 bytes，总大小约 316 bytes。  
+  
+/// sm_connect_req 的近似大小（不含 padding 的最小值）  
+/// 实际大小可能因 padding 而更大，建议先用此值尝试，  
+/// 如果固件拒绝则增加到 320 或 324  
+pub const SM_CONNECT_REQ_BASE_SIZE: usize =  
+    MAC_SSID_SIZE           // 33: ssid  
+    + MAC_ADDR_SIZE         // 6:  bssid  
+    + MAC_CHAN_DEF_SIZE     // 5:  chan  
+    + 4                     // flags (u32)  
+    + 2                     // ctrl_port_ethertype (u16)  
+    + 2                     // ie_len (u16)  
+    + 2                     // listen_interval (u16)  
+    + 1                     // dont_wait_bcmc (bool)  
+    + 1                     // auth_type (u8)  
+    + 1                     // uapsd_queues (u8)  
+    + 1                     // vif_idx (u8)  
+    + 256;                  // ie_buf (u32[64])  
+    // = 33 + 6 + 5 + 4 + 2 + 2 + 2 + 1 + 1 + 1 + 1 + 256 = 314  
+  
+/// sm_disconnect_req: reason_code(u16) + vif_idx(u8) = 3 bytes  
+pub const SM_DISCONNECT_REQ_SIZE: usize = 3;  
+  
+/// mm_key_add_req 结构体布局:  
+///   u8 key_idx;                    // offset 0  
+///   u8 sta_idx;                    // offset 1  
+///   [2 bytes padding]             // offset 2-3 (align mac_sec_key.array to u32)  
+///   struct mac_sec_key key;        // offset 4: length(u8) + [3B pad] + array[u32;8](32B) = 36B  
+///   u8 cipher_suite;               // offset 40  
+///   u8 inst_nbr;                   // offset 41  
+///   u8 spp;                        // offset 42  
+///   bool pairwise;                 // offset 43  
+///   总计: 44 bytes  
+pub const MM_KEY_ADD_REQ_SIZE: usize = 44;  
+  
+/// mm_key_del_req: hw_key_idx(u8) = 1 byte  
+pub const MM_KEY_DEL_REQ_SIZE: usize = 1;  
+  
+/// me_set_control_port_req: sta_idx(u8) + control_port_open(bool) = 2 bytes  
+pub const ME_SET_CONTROL_PORT_REQ_SIZE: usize = 2;  
+  
+/// sm_connect_ind 结构体布局（参考 lmac_msg.h:2444-2477）:  
+///   u16 status_code;  
+///   struct mac_addr bssid;         // 6 bytes  
+///   bool roamed;                   // 1 byte  
+///   u8 vif_idx;  
+///   u8 ap_idx;  
+///   u8 ch_idx;  
+///   bool qos;  
+///   u8 acm;  
+///   u16 assoc_req_ie_len;  
+///   u16 assoc_rsp_ie_len;  
+///   u32 assoc_ie_buf[200];         // SM_ASSOC_IE_LEN/4 = 800/4 = 200  
+///   u16 aid;  
+///   u8 band;  
+///   u16 center_freq;  
+///   u8 width;  
+///   u32 center_freq1;  
+///   u32 center_freq2;  
+///   u32 ac_param[4];               // AC_MAX = 4  
+pub const SM_ASSOC_IE_LEN: usize = 800;  
+  
+/// sm_disconnect_ind: reason_code(u16) + vif_idx(u8) + ft_over_ds(bool) + reassoc(u8) = 5 bytes  
+pub const SM_DISCONNECT_IND_SIZE: usize = 5;  
+  
+/// 连接结果（从 SM_CONNECT_IND 解析）  
+#[derive(Clone, Debug)]  
+pub struct ConnectResult {  
+    pub status_code: u16,  
+    pub bssid: [u8; 6],  
+    pub ap_idx: u8,  
+    pub ch_idx: u8,  
+    pub vif_idx: u8,  
+    pub qos: bool,  
+    pub aid: u16,  
+}  
+  
+/// 断连信息（从 SM_DISCONNECT_IND 解析）  
+#[derive(Clone, Debug)]  
+pub struct DisconnectInfo {  
+    pub reason_code: u16,  
+    pub vif_idx: u8,  
+}

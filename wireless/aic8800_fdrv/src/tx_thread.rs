@@ -2,7 +2,6 @@ use aic8800_sdio::SdioHost;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::vec;
-use core::ptr::{read_volatile, write_volatile};
 use core::{future::poll_fn, sync::atomic::Ordering};
 use core::task::Poll;
 
@@ -15,7 +14,6 @@ use sdhci_cv1800::{mask_unmask_card_irq_raw, regs::*};
 const TAIL_LEN: usize = 4;   
 const BUFFER_SIZE: usize = 1536;  
 const FLOW_CTRL_CMD_RETRY: u32 = 10;  
-const FLOW_CTRL_DATA_RETRY: u32 = 50;  
 /// 每次 tx_process 最多处理的数据帧数，防止饿死其他任务  
 const TX_BATCH_LIMIT: u32 = 16;  
 const MAX_TX_QUEUE_LEN: usize = 256;

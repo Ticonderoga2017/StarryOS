@@ -1,6 +1,5 @@
 use alloc::sync::Arc;
 use alloc::vec;
-use core::hint;
 use core::{future::poll_fn, sync::atomic::AtomicU64};
 use core::task::Poll;
 use core::sync::atomic::Ordering;
@@ -16,11 +15,6 @@ const RX_HWHRD_LEN: usize = 60;
 const RX_ALIGNMENT: usize = 4;  
 const MAX_PKT_LEN: u16 = 1600;  
 const SDIO_OTHER_INTERRUPT: u8 = 0x80; 
-
-/// block_cnt=0 时的最大轮询次数（每次 ~100us，500 次 ≈ 50ms）  
-const BLOCK_CNT_POLL_MAX: u32 = 500;  
-/// 每次轮询间隔的 spin_loop 次数（~100us @ 25MHz）  
-const BLOCK_CNT_POLL_INTERVAL: u32 = 2_500;  
 
 pub static RX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);  
 
@@ -65,13 +59,6 @@ pub fn start(bus: Arc<WifiBus>) {
                     cx.waker().wake_by_ref();  
                     return Poll::Pending;  
                 }
-
-                // // 二次检查（注册和中断之间可能有数据到达）
-                // process_rx_frames(&bus);
-
-                // if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {
-                //     cx.waker().wake_by_ref();
-                // }
 
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -241,11 +228,25 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                             "[wifi-rx] CFG_CMD_RSP: msg_id=0x{:04x}, param_len={}, total={}",  
                             msg_id, param_len, msg_data.len()  
                         );
+
+                        // 判断是 CFM 还是 IND
+                        let expected_cfm = bus.cmd_expected_cfm_id.load(Ordering::Acquire);
+                        if expected_cfm != 0 && msg_id == expected_cfm {
+                            let mut queue = bus.cmd_rsp_queue.lock();
+                            queue.push_back(msg_data.to_vec());
+                            drop(queue);
+                            bus.cmd_rsp_pollset.wake();
+                        } else {
+                            log::info!(  
+                                "[wifi-rx] IND routed: msg_id=0x{:04x} (expected=0x{:04x})",  
+                                msg_id, expected_cfm  
+                            );
+                            let mut queue = bus.ind_queue.lock();
+                            queue.push_back(msg_data.to_vec());
+                            drop(queue);
+                            bus.cmd_rsp_pollset.wake();
+                        }
                     }
-                    let mut queue = bus.cmd_rsp_queue.lock();
-                    queue.push_back(msg_data.to_vec());
-                    drop(queue);
-                    bus.cmd_rsp_pollset.wake();
                 }
                 SDIO_TYPE_CFG_DATA_CFM => {  
                     log::info!("[wifi-rx] DATA_CFM frame, len={}", pkt_len);  

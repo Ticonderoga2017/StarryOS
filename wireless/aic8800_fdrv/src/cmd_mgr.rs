@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{collections::vec_deque::VecDeque, sync::Arc};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::poll_fn;
@@ -81,6 +81,23 @@ pub fn send_cmd(
     param: &[u8],
     timeout_ms: u64
 ) -> Result<Vec<u8>, CmdError> {
+    send_cmd_with_cfm_id(bus, msg_id, dest_id, param, msg_id + 1, timeout_ms)
+}
+
+/// 发送 LMAC 命令并等待指定 CFM ID 的响应  
+///  
+/// 与 `send_cmd` 的区别：可以指定期望的 CFM ID。  
+/// 用于扫描等命令（`SCANU_START_REQ` 等待 `SCANU_START_CFM_ADDTIONAL`）。  
+///  
+/// 不匹配的消息（indication）会被路由到 `bus.ind_queue`。 
+pub fn send_cmd_with_cfm_id(
+    bus: &Arc<WifiBus>,
+    msg_id: u16,
+    dest_id: u16,
+    param: &[u8],
+    expected_cfm_id: u16,
+    timeout_ms: u64
+) -> Result<Vec<u8>, CmdError> {
     log::info!("[cmd_mgr] send_cmd enter: msg_id=0x{:04x}", msg_id);
 
     // 检查总线状态  
@@ -99,10 +116,7 @@ pub fn send_cmd(
     // ---- 构造 SDIO 帧 ----
     let frame = build_cmd_frame(msg_id, dest_id, param);
 
-    log::info!("[cmd_mgr] frame built, len={}", frame.len());
-
-    // 期望的 CFM ID = REQ ID + 1（LMAC 约定） 
-    let expected_cfm_id = msg_id + 1;
+    log::info!("[cmd_mgr] frame built, len={}", frame.len());    
 
     log::info!(  
         "[cmd_mgr] TX msg_id=0x{:04x}, dest=0x{:04x}, param_len={}, frame_len={}, timeout={}ms",  
@@ -123,6 +137,7 @@ pub fn send_cmd(
 
     // 清除错误标志  
     bus.cmd_rsp_error.store(false, Ordering::Release);  
+    bus.cmd_expected_cfm_id.store(expected_cfm_id, Ordering::Release);
 
     // ---- 通过 TX 线程发送（CMD 优先级）----
     {
@@ -130,7 +145,7 @@ pub fn send_cmd(
         *cmd_slot = Some(frame);
         bus.cmd_pending_flag.store(true, Ordering::Release);
     }
-    bus.tx_wake_pollset.wake(); // 唤醒 TX 线程
+    bus.tx_wake_pollset.wake(); // 唤醒 TX 线程    
 
     // ---- 等待 CFM（RX 线程放入 cmd_rsp_queue）----
     let start = axhal::time::monotonic_time_nanos();
@@ -177,6 +192,8 @@ pub fn send_cmd(
                             expected_cfm_id,  
                             msg.id  
                         );  
+                        bus.ind_queue.lock().push_back(rsp);
+                        bus.ind_pollset.wake();
                     }
                 } else {
                     // 响应格式无效，丢弃  
@@ -206,13 +223,25 @@ pub fn send_cmd(
                         } else {  
                             return Poll::Ready(Ok(rsp[param_start..].to_vec()));  
                         } 
+                    } else {
+                        log::info!(  
+                            "[cmd_mgr] IND routed (double-check): msg_id=0x{:04x}",  
+                            msg.id  
+                        );  
+                        bus.ind_queue.lock().push_back(rsp);  
+                        bus.ind_pollset.wake();  
                     }
                 }                
             }
         }
 
+        // 保持活跃以确保超时检查能触发  
+        cx.waker().wake_by_ref(); 
         Poll::Pending
     }));
+
+    // 清除期望的 CFM ID（无论成功、超时还是错误） 
+    bus.cmd_expected_cfm_id.store(0, Ordering::Release);
 
     match &result {  
         Ok(rsp) => log::info!("[cmd_mgr] send_cmd 0x{:04x} OK, rsp_len={}", msg_id, rsp.len()),  
@@ -526,4 +555,511 @@ pub fn send_mm_add_if_req(
         log::error!("[lmac] MM_ADD_IF_CFM too short: {} bytes", rsp.len());
         Err(CmdError::InvalidResponse)
     }
+}
+
+// ================================================================  
+// 扫描命令  
+// ================================================================  
+  
+/// 发送 SCANU_START_REQ（WiFi 扫描）  
+///  
+/// 扫描流程：  
+///   1. 发送 SCANU_START_REQ  
+///   2. 固件返回 N 个 SCANU_RESULT_IND（每个 AP 一个）→ 路由到 ind_queue  
+///   3. 固件返回 SCANU_START_CFM_ADDTIONAL（扫描完成）→ 作为 CFM 返回  
+///  
+/// 参数：  
+///   - `vif_idx`: VIF 索引（从 MM_ADD_IF_REQ 获得）  
+///   - `ssid`: 可选的目标 SSID（None = 被动扫描/广播扫描）  
+///   - `timeout_ms`: 超时时间（建议 15000-20000ms）  
+///  
+/// 返回 SCANU_START_CFM 的 param（3 字节: vif_idx, status, result_cnt） 
+pub fn send_scanu_start_req(
+    bus: &Arc<WifiBus>,
+    vif_idx: u8,
+    ssid: Option<&[u8]>,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, CmdError> {
+    // 构造 scanu_start_req param  
+    // 布局:  
+    //   chan[SCAN_CHANNEL_MAX] * MAC_CHAN_DEF_SIZE  = 42 * 5 = 210  
+    //   ssid[SCAN_SSID_MAX] * MAC_SSID_SIZE        = 3 * 33 = 99  
+    //   bssid                                       = 6  
+    //   add_ies (u32)                               = 4  
+    //   add_ie_len (u16)                            = 2  
+    //   vif_idx (u8)                                = 1  
+    //   chan_cnt (u8)                                = 1  
+    //   ssid_cnt (u8)                               = 1  
+    //   no_cck (bool/u8)                            = 1  
+    //   duration (u32)                              = 4  
+    //   总计                                        = 329  
+    let mut param = vec![0u8; SCANU_START_REQ_SIZE];
+
+    // ---- 填充 chan[0..14]（2.4GHz 信道 1-14）---- 
+    let chan_cnt = CHAN_2G4_FREQS.len(); //14
+    for i in 0..chan_cnt {
+        let off = i * MAC_CHAN_DEF_SIZE;
+        param[off..off + 2].copy_from_slice(&CHAN_2G4_FREQS[i].to_le_bytes()); // freq  
+        param[off + 2] = 0; // band = NL80211_BAND_2GHZ  
+        param[off + 3] = 0; // flags = 0  
+        param[off + 4] = 30; // tx_power = 30 dBm  
+    }
+
+    // ---- 填充 ssid[0]（如果指定）----  
+    let ssid_offset = SCAN_CHANNEL_MAX * MAC_CHAN_DEF_SIZE; // 210
+    let ssid_cnt = if let Some(s) = ssid {
+        let len = s.len().min(MAC_SSID_LEN);
+        param[ssid_offset] = len as u8; //ssid[0].length
+        param[ssid_offset + 1..ssid_offset + 1 + len].copy_from_slice(&s[..len]); // ssid[0].array  
+        1u8
+    } else {
+        0u8
+    };
+
+    // ---- 填充 bssid（广播地址 FF:FF:FF:FF:FF:FF）----  
+    let bssid_offset = ssid_offset + SCAN_SSID_MAX * MAC_SSID_SIZE; // 210 + 99 = 309  
+    param[bssid_offset..bssid_offset + 6].copy_from_slice(&[0xFF; 6]); 
+
+    // ---- 填充尾部字段 ----  
+    let tail_offset = bssid_offset + MAC_ADDR_SIZE; // 309 + 6 = 315  
+    // add_ies (u32) = 0  
+    // add_ie_len (u16) = 0  
+    param[tail_offset + 6] = vif_idx;       // vif_idx  
+    param[tail_offset + 7] = chan_cnt as u8; // chan_cnt  
+    param[tail_offset + 8] = ssid_cnt;      // ssid_cnt  
+    param[tail_offset + 9] = 0;             // no_cck = false  
+    // duration (u32) = 0（使用固件默认值）  
+
+    log::info!(  
+        "[cmd_mgr] sending SCANU_START_REQ: vif_idx={}, chan_cnt={}, ssid_cnt={}, param_size={}",  
+        vif_idx, chan_cnt, ssid_cnt, param.len()  
+    );  
+
+    // 等待 SCANU_START_CFM_ADDTIONAL (0x1009)，而非 SCANU_START_CFM (0x1001)  
+    send_cmd_with_cfm_id(  
+        bus,  
+        SCANU_START_REQ,           // 0x1000  
+        msg_t(TASK_SCANU, 0),      // dest_id = (TASK_SCANU << 8) | 0  
+        &param,  
+        SCANU_START_CFM_ADDTIONAL, // 0x1009  
+        timeout_ms,  
+    ) 
+}
+
+/// 从 ind_queue 中收集所有 SCANU_RESULT_IND 并解析为 ScanResult  
+///  
+/// 在 `send_scanu_start_req` 返回后调用。  
+/// 扫描期间固件发送的 SCANU_RESULT_IND 已被路由到 ind_queue。  
+pub fn collect_scan_results(bus: &Arc<WifiBus>) -> Vec<ScanResult> {
+    let mut results = Vec::new();
+    let mut queue = bus.ind_queue.lock();
+
+    // 取出所有 SCANU_RESULT_IND，其他 indication 放回  
+    let mut remaining = VecDeque::new();
+    while let Some(msg_data) = queue.pop_front() {
+        if msg_data.len() >= LmacMsg::SIZE {
+            let msg = LmacMsg::from_le_bytes(&msg_data);
+            if msg.id == SCANU_RESULT_IND {
+                // 解析 SCANU_RESULT_IND  
+                let param = &msg_data[LmacMsg::SIZE..];
+                if let Some(result) = parse_scanu_result_ind(param) {
+                    results.push(result);
+                }
+                continue;
+            }
+        }
+        // 非 SCANU_RESULT_IND，放回队列  
+        remaining.push_back(msg_data);
+    }
+
+    // 将非扫描 indication 放回  
+    *queue = remaining;
+
+    results
+}
+
+/// 解析 SCANU_RESULT_IND 的 param 部分  
+///  
+/// param 布局（scanu_result_ind）:  
+///   [0..2]  length (u16)     — 802.11 帧长度  
+///   [2..4]  framectrl (u16)  — Frame Control  
+///   [4..6]  center_freq (u16)  
+///   [6]     band (u8)  
+///   [7]     sta_idx (u8)  
+///   [8]     inst_nbr (u8)  
+///   [9]     rssi (i8)  
+///   [10..]  payload — 802.11 管理帧（Beacon/ProbeResp）
+fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
+    if param.len() < 10 {
+        return None;
+    }
+
+    let _frame_len = u16::from_le_bytes([param[0], param[1]]) as usize;  
+    let center_freq = u16::from_le_bytes([param[4], param[5]]);  
+    let rssi = param[9] as i8;  
+
+    let payload = &param[10..];  
+    if payload.len() < 24 {  
+        return None; // 802.11 管理帧头至少 24 字节  
+    }  
+
+    // 802.11 管理帧头部:  
+    //   [0..2]   Frame Control  
+    //   [2..4]   Duration  
+    //   [4..10]  DA  
+    //   [10..16] SA  
+    //   [16..22] BSSID  
+    //   [22..24] Sequence Control  
+    //   [24..]   Frame Body  
+    let mut bssid = [0u8; 6];  
+    bssid.copy_from_slice(&payload[16..22]);  
+
+    // Beacon/ProbeResp Frame Body:  
+    //   [0..8]   Timestamp (u64)  
+    //   [8..10]  Beacon Interval (u16)  
+    //   [10..12] Capability Info (u16)  
+    //   [12..]   Information Elements  
+    let body = &payload[24..];  
+    if body.len() < 12 {  
+        return None;  
+    }  
+
+    let beacon_interval = u16::from_le_bytes([body[8], body[9]]);  
+    let capability = u16::from_le_bytes([body[10], body[11]]);  
+  
+    // 解析 IE 提取 SSID (IE ID = 0)  
+    let mut ssid = [0u8; MAC_SSID_LEN];  
+    let mut ssid_len = 0u8;  
+    let mut ie_offset = 12;  
+    while ie_offset + 2 <= body.len() {  
+        let ie_id = body[ie_offset];  
+        let ie_len = body[ie_offset + 1] as usize;  
+        if ie_offset + 2 + ie_len > body.len() {  
+            break;  
+        }  
+        if ie_id == 0 {  
+            // SSID IE  
+            let len = ie_len.min(MAC_SSID_LEN);  
+            ssid[..len].copy_from_slice(&body[ie_offset + 2..ie_offset + 2 + len]);  
+            ssid_len = len as u8;  
+            break;  
+        }  
+        ie_offset += 2 + ie_len;  
+    }  
+  
+    Some(ScanResult {  
+        ssid,  
+        ssid_len,  
+        bssid,  
+        center_freq,  
+        rssi,  
+        capability,  
+        beacon_interval,  
+        raw_payload: payload.to_vec(),  
+    })  
+}
+
+/// 从 ind_queue 中等待指定 msg_id 的 indication  
+/// 超时返回 Err(CmdError::Timeout)  
+pub fn wait_for_indication(
+    bus: &Arc<WifiBus>,
+    target_msg_id: u16,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, CmdError> {
+    let deadline = axhal::time::monotonic_time_nanos() + timeout_ms as u64 * 1_000_000; 
+
+    let result = block_on(poll_fn(|cx| {
+        // 超时检查  
+        if axhal::time::monotonic_time_nanos() >= deadline {  
+            return Poll::Ready(Err(CmdError::Timeout));  
+        }  
+
+        // 在 ind_queue 中查找目标 msg_id  
+        {
+            let mut queue = bus.ind_queue.lock();
+            for i in 0..queue.len() {
+                if queue[i].len() >= LmacMsg::SIZE {
+                    let msg = LmacMsg::from_le_bytes(&queue[i]);
+                    if msg.id == target_msg_id {
+                        let raw = queue.remove(i).unwrap();
+                        let param_start = LmacMsg::SIZE;
+                        let param = if raw.len() > param_start {
+                            raw[param_start..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        return Poll::Ready(Ok(param));
+                    }
+                }
+            }
+        }
+
+        // 注册 waker，等待 ind_pollset 通知  
+        bus.ind_pollset.register(cx.waker());  
+
+        // 注册后再检查一次（防止 race）
+        {  
+            let mut queue = bus.ind_queue.lock();  
+            for i in 0..queue.len() {  
+                if queue[i].len() >= LmacMsg::SIZE {  
+                    let msg = LmacMsg::from_le_bytes(&queue[i]);  
+                    if msg.id == target_msg_id {  
+                        let raw = queue.remove(i).unwrap();  
+                        let param_start = LmacMsg::SIZE;  
+                        let param = if raw.len() > param_start {  
+                            raw[param_start..].to_vec()  
+                        } else {  
+                            Vec::new()  
+                        };  
+                        return Poll::Ready(Ok(param));  
+                    }  
+                }  
+            }  
+        }
+
+        // 保持活跃（与 rx_thread 相同策略）  
+        cx.waker().wake_by_ref();  
+        Poll::Pending  
+    }));
+
+    result
+}
+
+/// 发送 SM_CONNECT_REQ（连接到 AP） 
+/// sm_connect_req 结构体布局（含 C padding）:  
+///   [0..33]   mac_ssid ssid        (1+32)  
+///   [33]      padding              (1 byte, align mac_addr to u16)  
+///   [34..40]  mac_addr bssid       (6)  
+///   [40..45]  mac_chan_def chan     (5)  
+///   [45..48]  padding              (3 bytes, align u32 flags)  
+///   [48..52]  u32 flags  
+///   [52..54]  u16 ctrl_port_ethertype  
+///   [54..56]  u16 ie_len  
+///   [56..58]  u16 listen_interval  
+///   [58]      bool dont_wait_bcmc  
+///   [59]      u8 auth_type  
+///   [60]      u8 uapsd_queues  
+///   [61]      u8 vif_idx  
+///   [62..64]  padding              (2 bytes, align u32 ie_buf)  
+///   [64..320] u32 ie_buf[64]       (256)  
+///   总计: 320 bytes  
+///  
+/// 返回 SM_CONNECT_CFM 的 param（1 字节: status）  
+pub fn send_sm_connect_req(  
+    bus: &Arc<WifiBus>,  
+    vif_idx: u8,  
+    ssid: &[u8],  
+    bssid: &[u8; 6],  
+    channel_freq: u16,  
+    flags: u32,  
+    auth_type: u8,  
+    ie: &[u8],         // RSN IE 等附加 IE  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> {  
+    const SM_CONNECT_REQ_SIZE: usize = 320;  
+  
+    let mut param = vec![0u8; SM_CONNECT_REQ_SIZE]; 
+
+    // ssid [0..33]  
+    let ssid_len = ssid.len().min(MAC_SSID_LEN);  
+    param[0] = ssid_len as u8;  
+    param[1..1 + ssid_len].copy_from_slice(&ssid[..ssid_len]);  
+  
+    // bssid [34..40] (1 byte padding after ssid)  
+    param[34..40].copy_from_slice(bssid);  
+
+    // chan [40..45]  
+    if channel_freq != 0 && channel_freq != 0xFFFF {  
+        param[40..42].copy_from_slice(&channel_freq.to_le_bytes()); // freq  
+        param[42] = 0; // band = 2.4GHz  
+        param[43] = 0; // flags  
+        param[44] = 30; // tx_power  
+    } else {  
+        // 不指定信道：freq = 0xFFFF  
+        param[40..42].copy_from_slice(&0xFFFFu16.to_le_bytes());  
+    }  
+
+    // flags [48..52]  
+    param[48..52].copy_from_slice(&flags.to_le_bytes());  
+  
+    // ctrl_port_ethertype [52..54] = ETH_P_PAE (0x888E) in network byte order  
+    param[52..54].copy_from_slice(&ETH_P_PAE.to_be_bytes());  
+  
+    // ie_len [54..56]  
+    let ie_len = ie.len().min(256);  
+    param[54..56].copy_from_slice(&(ie_len as u16).to_le_bytes());  
+  
+    // listen_interval [56..58] = 1  
+    param[56..58].copy_from_slice(&1u16.to_le_bytes());  
+  
+    // dont_wait_bcmc [58] = 0 (wait for BC/MC)  
+    param[58] = 0;  
+  
+    // auth_type [59]  
+    param[59] = auth_type;  
+  
+    // uapsd_queues [60] = 0  
+    param[60] = 0;  
+  
+    // vif_idx [61]  
+    param[61] = vif_idx;  
+  
+    // ie_buf [64..64+ie_len]  
+    if ie_len > 0 {  
+        param[64..64 + ie_len].copy_from_slice(&ie[..ie_len]);  
+    }  
+
+    log::info!(  
+        "[cmd_mgr] sending SM_CONNECT_REQ: vif={}, ssid_len={}, auth={}, flags=0x{:08x}, ie_len={}",  
+        vif_idx, ssid_len, auth_type, flags, ie_len  
+    );  
+  
+    // Linux 驱动等待 SM_CONNECT_CFM (msg_id + 1)  
+    send_cmd(bus, SM_CONNECT_REQ, msg_t(TASK_SM, 0), &param, timeout_ms)     
+}
+
+/// 发送 SM_DISCONNECT_REQ  
+/// 对应 Linux: rwnx_send_sm_disconnect_req (rwnx_msg_tx.c:3239-3258)  
+///  
+/// sm_disconnect_req:  
+///   u16 reason_code;  [0..2]  
+///   u8  vif_idx;      [2]  
+///   总计: 3 bytes  
+pub fn send_sm_disconnect_req(  
+    bus: &Arc<WifiBus>,  
+    vif_idx: u8,  
+    reason_code: u16,  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> {  
+    let mut param = [0u8; 3];  
+    param[0..2].copy_from_slice(&reason_code.to_le_bytes());  
+    param[2] = vif_idx;  
+
+    log::info!(  
+        "[cmd_mgr] sending SM_DISCONNECT_REQ: vif={}, reason={}",  
+        vif_idx, reason_code  
+    );  
+  
+    send_cmd(bus, SM_DISCONNECT_REQ, msg_t(TASK_SM, 0), &param, timeout_ms)  
+}
+
+/// 发送 MM_KEY_ADD_REQ（安装加密密钥）  
+/// 对应 Linux: rwnx_send_key_add (rwnx_msg_tx.c:641-679)  
+///  
+/// mm_key_add_req 结构体:  
+///   u8  key_idx;       [0]  
+///   u8  sta_idx;       [1]  
+///   mac_sec_key key;   [2..35]  (u8 length + u32 array[8] → 1+3padding+32=36? 或 1+32=33?)  
+///   u8  cipher_suite;  
+///   u8  inst_nbr;  
+///   u8  spp;  
+///   bool pairwise;  
+///  
+/// mac_sec_key: { u8 length; u32 array[8]; }  
+///   C layout: length at [0], padding [1..4], array at [4..36] → 总 36 bytes  
+///   或者 length at [0], array at [4..36] (u32 alignment) → 总 36 bytes  
+///  
+/// mm_key_add_req 总大小:  
+///   key_idx(1) + sta_idx(1) + padding(2) + mac_sec_key(36) + cipher(1) + inst_nbr(1) + spp(1) + pairwise(1)  
+///   = 44 bytes  
+pub fn send_key_add_req(  
+    bus: &Arc<WifiBus>,  
+    vif_idx: u8,  
+    sta_idx: u8,  
+    pairwise: bool,  
+    key: &[u8],  
+    key_idx: u8,  
+    cipher_suite: u8,  
+    timeout_ms: u64,  
+) -> Result<u8, CmdError> { 
+    const MM_KEY_ADD_REQ_SIZE: usize = 44;  
+  
+    let mut param = [0u8; MM_KEY_ADD_REQ_SIZE];  
+  
+    // key_idx [0]  
+    param[0] = key_idx;  
+    // sta_idx [1]  
+    param[1] = sta_idx;  
+    // padding [2..4]  
+
+    // mac_sec_key [4..40]:  
+    //   length [4]  
+    //   padding [5..8]  
+    //   array [8..40] (u32 array[8], 32 bytes)  
+    let key_len = key.len().min(MAC_SEC_KEY_LEN);  
+    param[4] = key_len as u8; 
+    // 密钥数据写入 array 字段（offset 8）  
+    // 注意：Linux 驱动用 memcpy(&key.array[0], key, key_len)  
+    // array 是 u32[]，但 memcpy 按字节拷贝，所以直接拷贝即可  
+    param[8..8 + key_len].copy_from_slice(&key[..key_len]);  
+
+    // cipher_suite [40]  
+    param[40] = cipher_suite;  
+    // inst_nbr [41]  
+    param[41] = vif_idx;  
+    // spp [42]  
+    param[42] = 0;  
+    // pairwise [43]  
+    param[43] = if pairwise { 1 } else { 0 };  
+  
+    log::info!(  
+        "[cmd_mgr] sending MM_KEY_ADD_REQ: sta={}, key_idx={}, cipher={}, pairwise={}, key_len={}",  
+        sta_idx, key_idx, cipher_suite, pairwise, key_len  
+    );  
+
+    let rsp = send_cmd(bus, MM_KEY_ADD_REQ, TASK_MM, &param, timeout_ms)?;
+
+    // mm_key_add_cfm: status(u8) + hw_key_idx(u8) + aligned[2]  
+    if rsp.len() >= 2 {
+        let status = rsp[0];
+        let hw_key_idx = rsp[1];
+        if status != 0 {  
+            log::error!("[cmd_mgr] MM_KEY_ADD_CFM status={} (error)", status);  
+            return Err(CmdError::FirmwareError);  
+        }  
+        log::info!("[cmd_mgr] MM_KEY_ADD_CFM OK: hw_key_idx={}", hw_key_idx);  
+        Ok(hw_key_idx)   
+    } else {
+        log::error!("[cmd_mgr] MM_KEY_ADD_CFM too short: {} bytes", rsp.len());  
+        Err(CmdError::InvalidResponse)  
+    }
+}
+
+/// 发送 MM_KEY_DEL_REQ  
+/// 对应 Linux: rwnx_send_key_del (rwnx_msg_tx.c:682-698)  
+///  
+/// mm_key_del_req: { u8 hw_key_idx; } → 1 byte  
+pub fn send_key_del_req(  
+    bus: &Arc<WifiBus>,  
+    hw_key_idx: u8,  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> {
+    let param = [hw_key_idx];  
+  
+    log::info!("[cmd_mgr] sending MM_KEY_DEL_REQ: hw_key_idx={}", hw_key_idx);  
+  
+    send_cmd(bus, MM_KEY_DEL_REQ, TASK_MM, &param, timeout_ms)  
+}
+
+/// 发送 ME_SET_CONTROL_PORT_REQ  
+/// 对应 Linux: rwnx_send_me_set_control_port_req (rwnx_msg_tx.c:2779-2797)  
+///  
+/// me_set_control_port_req:  
+///   u8   sta_idx;            [0]  
+///   bool control_port_open;  [1]  
+///   总计: 2 bytes  
+pub fn send_set_control_port_req(  
+    bus: &Arc<WifiBus>,  
+    sta_idx: u8,  
+    open: bool,  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> {  
+    let param = [sta_idx, if open { 1 } else { 0 }];  
+  
+    log::info!(  
+        "[cmd_mgr] sending ME_SET_CONTROL_PORT_REQ: sta_idx={}, open={}",  
+        sta_idx, open  
+    );  
+  
+    send_cmd(bus, ME_SET_CONTROL_PORT_REQ, TASK_ME, &param, timeout_ms)  
 }

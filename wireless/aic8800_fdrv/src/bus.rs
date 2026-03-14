@@ -69,6 +69,11 @@ pub struct WifiBus {
     /// CmdMgr 错误标志：shutdown 时设为 true，  
     /// send_cmd 等待者被唤醒后检查此标志返回 Err  
     pub cmd_rsp_error: AtomicBool,
+
+    pub ind_queue: SpinNoIrq<VecDeque<Vec<u8>>>, // 异步 indication 队列
+    pub ind_pollset: PollSet, // indication 到达通知
+
+    pub cmd_expected_cfm_id: AtomicU16, // 当前等待的 CFM msg_id
 }
 
 impl WifiBus {
@@ -97,6 +102,9 @@ impl WifiBus {
             cmd_pending: SpinNoIrq::new(None), 
             cmd_pending_flag: AtomicBool::new(false), 
             cmd_rsp_error: AtomicBool::new(false),
+            ind_queue: SpinNoIrq::new(VecDeque::new()),
+            ind_pollset: PollSet::new(),
+            cmd_expected_cfm_id: AtomicU16::new(0),
         })
     }
 
@@ -129,6 +137,9 @@ impl WifiBus {
         self.cmd_rsp_pollset.wake();  
         self.tx_cfm_pollset.wake();  
         self.sdhci_pollset.wake();
+
+        self.ind_pollset.wake();
+        self.ind_queue.lock().clear();
 
         clear_global_bus();
     
