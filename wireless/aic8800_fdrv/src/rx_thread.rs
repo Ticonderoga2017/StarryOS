@@ -244,7 +244,7 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                             let mut queue = bus.ind_queue.lock();
                             queue.push_back(msg_data.to_vec());
                             drop(queue);
-                            bus.cmd_rsp_pollset.wake();
+                            bus.ind_pollset.wake();
                         }
                     }
                 }

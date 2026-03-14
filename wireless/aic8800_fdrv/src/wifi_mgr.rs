@@ -13,46 +13,6 @@ use crate::bus::WifiBus;
 use crate::cmd_mgr::*;
 use crate::lmac_msg::*;
 
-/// WiFi 连接状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WifiState {
-    /// 未连接
-    Disconnected,
-    /// 正在扫描
-    Scanning,
-    /// 正在连接
-    Connecting,
-    /// 已连接（关联成功，但密钥可能尚未安装）
-    Connected,
-    /// 已认证（WPA2 握手完成，控制端口已打开）
-    Authenticated,
-}
-
-/// 连接结果（从 SM_CONNECT_IND 解析）
-#[derive(Debug, Clone)]
-pub struct ConnectResult {
-    /// 802.11 状态码 (0 = 成功)
-    pub status_code: u16,
-    /// AP 的 BSSID
-    pub bssid: [u8; 6],
-    /// AP 的 STA index（固件分配）
-    pub ap_idx: u8,
-    /// 信道 index
-    pub ch_idx: u8,
-    /// VIF index
-    pub vif_idx: u8,
-    /// AID (Association ID)
-    pub aid: u16,
-    pub qos: bool,
-}
-
-/// 断连结果（从 SM_DISCONNECT_IND 解析）
-#[derive(Debug, Clone)]
-pub struct DisconnectResult {
-    pub reason_code: u16,
-    pub vif_idx: u8,
-}
-
 // ================================================================
 // 扫描
 // ================================================================
@@ -85,28 +45,12 @@ pub fn scan(
 
     // 发送 SCANU_START_REQ 并等待 SCANU_START_CFM_ADDTIONAL
     let cfm = send_scanu_start_req(bus, vif_idx, ssid, timeout_ms)?;
-
     log::info!("[wifi_mgr] SCANU_START_CFM received, cfm_len={}", cfm.len());
 
-    // 从 ind_queue 收集所有 SCANU_RESULT_IND
-    let results = collect_scan_results(bus);
-
-    log::info!("[wifi_mgr] scan complete, {} APs found", results.len());
-
-    for (i, ap) in results.iter().enumerate() {
-        let ssid_str = core::str::from_utf8(
-            &ap.ssid[..ap.ssid_len as usize]
-        ).unwrap_or("<non-utf8>");
-        log::info!(
-            "  [{}] SSID=\"{}\" BSSID={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} freq={} rssi={}",
-            i, ssid_str,
-            ap.bssid[0], ap.bssid[1], ap.bssid[2],
-            ap.bssid[3], ap.bssid[4], ap.bssid[5],
-            ap.center_freq, ap.rssi
-        );
-    }
-
-    Ok(results)
+    let results = collect_scan_results(bus, timeout_ms);
+    
+    log::info!("[wifi_mgr] scan complete, {} APs found", results.len());  
+    Ok(results)  
 }
 
 /// 在扫描结果中查找指定 SSID 的 AP
@@ -230,7 +174,7 @@ fn parse_connect_ind(param: &[u8]) -> Result<ConnectResult, CmdError> {
     //   [18..20]  2B padding (u32[] alignment)  
     //   [20..820] u32  assoc_ie_buf[200] (800 bytes)  
     //   [820..822] u16 aid  
-    //   ...  
+    //   ...      
   
     if param.len() < 12 {  
         log::error!("[wifi_mgr] SM_CONNECT_IND too short: {} bytes", param.len());  
@@ -254,6 +198,12 @@ fn parse_connect_ind(param: &[u8]) -> Result<ConnectResult, CmdError> {
         log::warn!("[wifi_mgr] SM_CONNECT_IND too short for aid field ({} bytes), defaulting to 0", param.len());  
         0  
     };  
+
+    log::info!(  
+        "[wifi_mgr] SM_CONNECT_IND param_len={}, status={}, bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        param.len(), status_code,  
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]  
+    );
   
     Ok(ConnectResult {  
         status_code,  

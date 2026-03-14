@@ -15,6 +15,10 @@ fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
 }
 
+fn current_time_ms() -> u64 {  
+    axhal::time::monotonic_time_nanos() / 1_000_000  
+}
+
 /// 构造 SDIO CMD 帧  
 /// 格式：[4B sdio_header][4B dummy][8B lmac_msg][NB param]  
 /// 对齐：TX_ALIGNMENT → TAIL_LEN → SDIOWIFI_FUNC_BLOCKSIZE  
@@ -596,7 +600,7 @@ pub fn send_scanu_start_req(
     let mut param = vec![0u8; SCANU_START_REQ_SIZE];
 
     // ---- 填充 chan[0..14]（2.4GHz 信道 1-14）---- 
-    let chan_cnt = CHAN_2G4_FREQS.len(); //14
+    let chan_cnt = CHAN_2G4_FREQS.len().min(SCAN_CHANNEL_MAX); 
     for i in 0..chan_cnt {
         let off = i * MAC_CHAN_DEF_SIZE;
         param[off..off + 2].copy_from_slice(&CHAN_2G4_FREQS[i].to_le_bytes()); // freq  
@@ -606,7 +610,7 @@ pub fn send_scanu_start_req(
     }
 
     // ---- 填充 ssid[0]（如果指定）----  
-    let ssid_offset = SCAN_CHANNEL_MAX * MAC_CHAN_DEF_SIZE; // 210
+    let ssid_offset = SCAN_CHANNEL_MAX * MAC_CHAN_DEF_SIZE; 
     let ssid_cnt = if let Some(s) = ssid {
         let len = s.len().min(MAC_SSID_LEN);
         param[ssid_offset] = len as u8; //ssid[0].length
@@ -617,17 +621,17 @@ pub fn send_scanu_start_req(
     };
 
     // ---- 填充 bssid（广播地址 FF:FF:FF:FF:FF:FF）----  
-    let bssid_offset = ssid_offset + SCAN_SSID_MAX * MAC_SSID_SIZE; // 210 + 99 = 309  
+    let bssid_offset = ssid_offset + SCAN_SSID_MAX * MAC_SSID_SIZE + 1; // 252 + 99 + 1 = 352  
     param[bssid_offset..bssid_offset + 6].copy_from_slice(&[0xFF; 6]); 
 
     // ---- 填充尾部字段 ----  
-    let tail_offset = bssid_offset + MAC_ADDR_SIZE; // 309 + 6 = 315  
+    let tail_offset = bssid_offset + MAC_ADDR_SIZE + 2; // 352 + 6 + 2
     // add_ies (u32) = 0  
     // add_ie_len (u16) = 0  
     param[tail_offset + 6] = vif_idx;       // vif_idx  
     param[tail_offset + 7] = chan_cnt as u8; // chan_cnt  
     param[tail_offset + 8] = ssid_cnt;      // ssid_cnt  
-    param[tail_offset + 9] = 0;             // no_cck = false  
+    param[tail_offset + 9] = 0;
     // duration (u32) = 0（使用固件默认值）  
 
     log::info!(  
@@ -639,7 +643,7 @@ pub fn send_scanu_start_req(
     send_cmd_with_cfm_id(  
         bus,  
         SCANU_START_REQ,           // 0x1000  
-        msg_t(TASK_SCANU, 0),      // dest_id = (TASK_SCANU << 8) | 0  
+        TASK_SCANU,      
         &param,  
         SCANU_START_CFM_ADDTIONAL, // 0x1009  
         timeout_ms,  
@@ -650,33 +654,104 @@ pub fn send_scanu_start_req(
 ///  
 /// 在 `send_scanu_start_req` 返回后调用。  
 /// 扫描期间固件发送的 SCANU_RESULT_IND 已被路由到 ind_queue。  
-pub fn collect_scan_results(bus: &Arc<WifiBus>) -> Vec<ScanResult> {
+pub fn collect_scan_results(
+    bus: &Arc<WifiBus>,
+    timeout_ms: u64,
+) -> Vec<ScanResult> {
     let mut results = Vec::new();
-    let mut queue = bus.ind_queue.lock();
+    let deadline = current_time_ms() + timeout_ms;
 
-    // 取出所有 SCANU_RESULT_IND，其他 indication 放回  
-    let mut remaining = VecDeque::new();
-    while let Some(msg_data) = queue.pop_front() {
-        if msg_data.len() >= LmacMsg::SIZE {
-            let msg = LmacMsg::from_le_bytes(&msg_data);
-            if msg.id == SCANU_RESULT_IND {
-                // 解析 SCANU_RESULT_IND  
+    loop {
+        let now = current_time_ms();
+        if now >= deadline {
+            log::warn!("[collect] scan collection timed out after {}ms", timeout_ms);  
+            break; 
+        }
+
+        // 从 ind_queue 中取出消息  
+        let msg_opt = {
+            let mut queue = bus.ind_queue.lock();
+            let mut found_idx = None;
+            for i in 0..queue.len() {
+                if queue[i].len() >= LmacMsg::SIZE {
+                    let msg = LmacMsg::from_le_bytes(&queue[i]);
+                    if msg.id == SCANU_RESULT_IND 
+                        || msg.id == SCANU_START_CFM
+                        || msg.id == SCANU_START_CFM_ADDTIONAL {
+                        found_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            found_idx.map(|i| queue.remove(i).unwrap())
+        };
+
+        match msg_opt {
+            Some(msg_data) => {
+                let msg = LmacMsg::from_le_bytes(&msg_data);
+                if msg.id == SCANU_START_CFM {
+                    log::info!("[collect] SCANU_START_CFM received, scan truly complete");  
+                    break;  
+                }
+                if msg.id == SCANU_START_CFM_ADDTIONAL {
+                    log::info!("[collect] SCANU_START_CFM_ADDTIONAL in ind_queue, skipping");  
+                    continue;  
+                }
+                // SCANU_RESULT_IND  
                 let param = &msg_data[LmacMsg::SIZE..];
                 if let Some(result) = parse_scanu_result_ind(param) {
                     results.push(result);
                 }
-                continue;
+            }
+            None => {
+                // 队列中没有扫描相关消息，短暂等待  
+                axtask::yield_now();  
             }
         }
-        // 非 SCANU_RESULT_IND，放回队列  
-        remaining.push_back(msg_data);
     }
 
-    // 将非扫描 indication 放回  
-    *queue = remaining;
+    // 按 BSSID 去重，保留 RSSI 最强的 
+    let before_dedup = results.len();
+    let mut deduped: Vec<ScanResult> = Vec::new();
+    for r in results {
+        if let Some(existing) = deduped.iter_mut().find(|e| e.bssid == r.bssid) {
+            // 同一 BSSID，保留 RSSI 更强的（rssi 是负数，越大越强） 
+            let r_freq = r.center_freq;
+            let r_rssi = r.rssi;
+            if r_rssi > existing.rssi {
+                let old_freq = existing.center_freq;
+                *existing = r;
+                if existing.center_freq == 0 && old_freq != 0 {
+                    existing.center_freq = old_freq;
+                }
+            } else if existing.center_freq == 0 && r_freq != 0 {
+                existing.center_freq = r_freq;
+            }
+        } else {
+            deduped.push(r);
+        }
+    }
 
-    results
+    if before_dedup != deduped.len() {
+        log::info!(  
+            "[collect] deduplicated: {} -> {} unique APs",  
+            before_dedup, deduped.len()  
+        ); 
+    }
+
+
+    log::info!("[collect] total {} APs found", deduped.len());  
+    deduped  
 }
+
+fn channel_to_freq(channel: u8) -> u16 {  
+    match channel {  
+        1..=13 => 2407 + (channel as u16) * 5,  
+        14 => 2484,  
+        36..=177 => 5000 + (channel as u16) * 5,  
+        _ => 0,  
+    }  
+}  
 
 /// 解析 SCANU_RESULT_IND 的 param 部分  
 ///  
@@ -690,62 +765,105 @@ pub fn collect_scan_results(bus: &Arc<WifiBus>) -> Vec<ScanResult> {
 ///   [9]     rssi (i8)  
 ///   [10..]  payload — 802.11 管理帧（Beacon/ProbeResp）
 fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
-    if param.len() < 10 {
+    log::info!(  
+        "[parse] SCANU_RESULT_IND param_len={}, first_bytes={:02x?}",  
+        param.len(),  
+        &param[..param.len().min(20)]  
+    );  
+
+    if param.len() < 12 {
+        log::warn!("[parse] SCANU_RESULT_IND too short: {} bytes", param.len()); 
         return None;
     }
 
-    let _frame_len = u16::from_le_bytes([param[0], param[1]]) as usize;  
-    let center_freq = u16::from_le_bytes([param[4], param[5]]);  
+    let length = u16::from_le_bytes([param[0], param[1]]);  
+    let framectrl = u16::from_le_bytes([param[2], param[3]]); 
+    let mut center_freq = u16::from_le_bytes([param[4], param[5]]);  
+    let band = param[6]; 
+    let _sta_idx = param[7];
+    let _inst_nbr = param[8];
     let rssi = param[9] as i8;  
 
-    let payload = &param[10..];  
-    if payload.len() < 24 {  
-        return None; // 802.11 管理帧头至少 24 字节  
-    }  
+    log::info!(  
+        "[parse] length={}, framectrl=0x{:04x}, freq={}, band={}, rssi={}",  
+        length, framectrl, center_freq, band, rssi  
+    ); 
 
-    // 802.11 管理帧头部:  
-    //   [0..2]   Frame Control  
+    let payload = &param[12..];  
+
+    // payload 是 802.11 管理帧（Beacon/ProbeResp）  
+    // 802.11 管理帧头部：  
+    //   [0..2]   Frame Control (已在 framectrl 中)  
     //   [2..4]   Duration  
-    //   [4..10]  DA  
-    //   [10..16] SA  
+    //   [4..10]  DA (destination address)  
+    //   [10..16] SA (source address) = BSSID for beacon  
     //   [16..22] BSSID  
     //   [22..24] Sequence Control  
-    //   [24..]   Frame Body  
+    //   [24..32] Timestamp (8 bytes)  
+    //   [32..34] Beacon Interval  
+    //   [34..36] Capability Info  
+    //   [36..]   Information Elements  
+
+    if payload.len() < 36 {  
+        log::warn!("[parse] payload too short for 802.11 header: {}", payload.len());  
+        return None; 
+    }  
+
     let mut bssid = [0u8; 6];  
     bssid.copy_from_slice(&payload[16..22]);  
 
-    // Beacon/ProbeResp Frame Body:  
-    //   [0..8]   Timestamp (u64)  
-    //   [8..10]  Beacon Interval (u16)  
-    //   [10..12] Capability Info (u16)  
-    //   [12..]   Information Elements  
-    let body = &payload[24..];  
-    if body.len() < 12 {  
-        return None;  
-    }  
-
-    let beacon_interval = u16::from_le_bytes([body[8], body[9]]);  
-    let capability = u16::from_le_bytes([body[10], body[11]]);  
+    log::info!(  
+        "[parse] BSSID={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]  
+    );
   
-    // 解析 IE 提取 SSID (IE ID = 0)  
+    let beacon_interval = u16::from_le_bytes([payload[32], payload[33]]);  
+    let capability = u16::from_le_bytes([payload[34], payload[35]]);  
+  
+    // 解析 SSID IE (Element ID = 0)  
+    let ie_data = &payload[36..];
     let mut ssid = [0u8; MAC_SSID_LEN];  
-    let mut ssid_len = 0u8;  
-    let mut ie_offset = 12;  
-    while ie_offset + 2 <= body.len() {  
-        let ie_id = body[ie_offset];  
-        let ie_len = body[ie_offset + 1] as usize;  
-        if ie_offset + 2 + ie_len > body.len() {  
+    let mut ssid_len: u8 = 0;  
+    let mut ds_channel: u8 = 0; // DS Parameter Set 中的 channel  
+
+    let mut ie_offset = 0;  
+    while ie_offset + 2 <= ie_data.len() {  
+        let ie_id = ie_data[ie_offset];  
+        let ie_len = ie_data[ie_offset + 1] as usize;  
+
+        if ie_offset + 2 + ie_len > ie_data.len() {  
             break;  
         }  
-        if ie_id == 0 {  
-            // SSID IE  
-            let len = ie_len.min(MAC_SSID_LEN);  
-            ssid[..len].copy_from_slice(&body[ie_offset + 2..ie_offset + 2 + len]);  
-            ssid_len = len as u8;  
-            break;  
-        }  
+
+        match ie_id {
+            0 => {
+                ssid_len = ie_len.min(MAC_SSID_LEN) as u8;  
+                ssid[..ssid_len as usize].copy_from_slice(&ie_data[ie_offset + 2..ie_offset + 2 + ssid_len as usize]); 
+            }
+            3 => {
+                if ie_len >= 1 {
+                    ds_channel = ie_data[ie_offset + 2];
+                }
+            }
+            _ => {}
+        }
         ie_offset += 2 + ie_len;  
     }  
+  
+    if center_freq == 0 && ds_channel != 0 {
+        center_freq = channel_to_freq(ds_channel);
+        log::info!(  
+            "[parse] center_freq was 0, fallback from DS channel {} -> {} MHz",  
+            ds_channel, center_freq  
+        );  
+    }
+
+    log::info!(  
+        "[parse] AP: ssid=\"{}\", bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, freq={}, rssi={}",  
+        core::str::from_utf8(&ssid[..ssid_len as usize]).unwrap_or("<invalid>"),  
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],  
+        center_freq, rssi  
+    );
   
     Some(ScanResult {  
         ssid,  
@@ -915,7 +1033,7 @@ pub fn send_sm_connect_req(
     );  
   
     // Linux 驱动等待 SM_CONNECT_CFM (msg_id + 1)  
-    send_cmd(bus, SM_CONNECT_REQ, msg_t(TASK_SM, 0), &param, timeout_ms)     
+    send_cmd(bus, SM_CONNECT_REQ, TASK_SM, &param, timeout_ms)     
 }
 
 /// 发送 SM_DISCONNECT_REQ  
@@ -940,7 +1058,7 @@ pub fn send_sm_disconnect_req(
         vif_idx, reason_code  
     );  
   
-    send_cmd(bus, SM_DISCONNECT_REQ, msg_t(TASK_SM, 0), &param, timeout_ms)  
+    send_cmd(bus, SM_DISCONNECT_REQ, TASK_SM, &param, timeout_ms)  
 }
 
 /// 发送 MM_KEY_ADD_REQ（安装加密密钥）  

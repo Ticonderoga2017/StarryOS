@@ -65,8 +65,7 @@ fn sdio1_probe() {
     use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
     use alloc::sync::Arc;
     use axsync::Mutex;
-    use aic8800_fdrv::bus::{BusState, WifiBus};
-    use aic8800_fdrv::cmd_mgr::*;
+    use aic8800_fdrv::{bus::{BusState, WifiBus}, cmd_mgr::*, wifi_mgr::*};
   
    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
@@ -154,6 +153,27 @@ fn sdio1_probe() {
                             }
 
                             info!("========== LMAC Config End ==========");
+
+                            match scan(&bus, 0, None, 20000) {
+                                Ok(results) => {  
+                                    info!("[SCAN] Found {} APs", results.len());  
+                                    for (i, ap) in results.iter().enumerate() {  
+                                        let ssid = core::str::from_utf8(&ap.ssid[..ap.ssid_len as usize])  
+                                            .unwrap_or("<non-utf8>");  
+                                        info!("  [{}] \"{}\" rssi={} freq={}", i, ssid, ap.rssi, ap.center_freq);  
+                                    }  
+                                }  
+                                Err(e) => error!("[SCAN] FAILED: {:?}", e),  
+                            }
+
+                            // let target_ssid = b"midea_db_0467";  
+                            // if let Some(ap) = find_ap_by_ssid(&results, target_ssid) {  
+                            //     let rsn_ie = build_wpa2_rsn_ie();  
+                            //     match connect(&bus, 0, target_ssid, &ap.bssid, ap.center_freq, &rsn_ie, 15000) {  
+                            //         Ok(result) => info!("[CONNECT] OK: ap_idx={}, aid={}", result.ap_idx, result.aid),  
+                            //         Err(e) => error!("[CONNECT] FAILED: {:?}", e),  
+                            //     }  
+                            // }
 
                             bus.dump_status(); // 打印完整状态  
                             core::mem::forget(bus); // 临时 leak                              

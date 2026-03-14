@@ -25,20 +25,15 @@ impl LmacMsg {
         }
     }
 
-    /// 序列化为 8 字节小端序 
-    pub fn to_le_bytes(&self) -> [u8; 8] {
-        let mut buf = [0u8; 8];  
-        buf[0..2].copy_from_slice(&self.id.to_le_bytes());  
-        buf[2..4].copy_from_slice(&self.dest_id.to_le_bytes());  
-        buf[4..6].copy_from_slice(&self.src_id.to_le_bytes());  
-        buf[6..8].copy_from_slice(&self.param_len.to_le_bytes());  
-        buf 
-    }
-}
-
-/// MSG_T(task, idx) = (task << 8) | idx  
-pub const fn msg_t(task: u16, idx: u8) -> u16 {  
-    (task << 8) | (idx as u16)  
+    // /// 序列化为 8 字节小端序 
+    // pub fn to_le_bytes(&self) -> [u8; 8] {
+    //     let mut buf = [0u8; 8];  
+    //     buf[0..2].copy_from_slice(&self.id.to_le_bytes());  
+    //     buf[2..4].copy_from_slice(&self.dest_id.to_le_bytes());  
+    //     buf[4..6].copy_from_slice(&self.src_id.to_le_bytes());  
+    //     buf[6..8].copy_from_slice(&self.param_len.to_le_bytes());  
+    //     buf 
+    // }
 }
 
 /// 构造宏：LMAC_FIRST_MSG(task) = (task << 10)
@@ -181,8 +176,8 @@ pub const MAC_ADDR_LEN: usize = 6;
 /// 从 msg_id 提取 task_id: bits[15..10]
 pub const fn msg_task(id: u16) -> u16 { id >> 10 }
 
-/// mac_chan_def: 5 bytes (freq:u16 + band:u8 + flags:u8 + tx_power:i8)
-pub const MAC_CHAN_DEF_SIZE: usize = 5;
+/// mac_chan_def: 6 bytes (freq:u16 + band:u8 + flags:u8 + tx_power:i8)
+pub const MAC_CHAN_DEF_SIZE: usize = 6;
 
 /// mac_ssid: 33 bytes (length:u8 + array:[u8;32])
 pub const MAC_SSID_SIZE: usize = 33;
@@ -190,22 +185,18 @@ pub const MAC_SSID_SIZE: usize = 33;
 /// mac_addr: 6 bytes (array:[u16;3], 即 6 字节)
 pub const MAC_ADDR_SIZE: usize = 6;
 
-/// scanu_start_req 总大小:
-///   chan[42] * 5 = 210
-///   ssid[3] * 33 = 99
-///   bssid = 6
-///   add_ies = 4 (u32)
-///   add_ie_len = 2 (u16)
-///   vif_idx = 1
-///   chan_cnt = 1
-///   ssid_cnt = 1
-///   no_cck = 1
-///   duration = 4 (u32)
-///   总计 = 210 + 99 + 6 + 4 + 2 + 1 + 1 + 1 + 1 + 4 = 329
-pub const SCANU_START_REQ_SIZE: usize = MAC_CHAN_DEF_SIZE * SCAN_CHANNEL_MAX
-    + MAC_SSID_SIZE * SCAN_SSID_MAX
-    + MAC_ADDR_SIZE
-    + 4 + 2 + 1 + 1 + 1 + 1 + 4;
+//   chan[42]:     42 * 6 = 252   (offset 0)
+//   ssid[3]:     3 * 33 = 99    (offset 252)
+//   bssid:       6              (offset 351)
+//   add_ies:     4              (offset 357 → pad to 360)
+//   add_ie_len:  2              (offset 364)
+//   vif_idx:     1              (offset 366)
+//   chan_cnt:     1              (offset 367)
+//   ssid_cnt:    1              (offset 368)
+//   no_cck:      1              (offset 369)
+//   duration:    4              (offset 370 → pad to 372)
+//   total:       376
+pub const SCANU_START_REQ_SIZE: usize = 376;
 
 /// scanu_start_cfm: 3 bytes (vif_idx:u8 + status:u8 + result_cnt:u8)
 /// scanu_result_ind 头部: 10 bytes (length:u16 + framectrl:u16 + center_freq:u16
@@ -381,6 +372,21 @@ pub const SM_ASSOC_IE_LEN: usize = 800;
 /// sm_disconnect_ind: reason_code(u16) + vif_idx(u8) + ft_over_ds(bool) + reassoc(u8) = 5 bytes  
 pub const SM_DISCONNECT_IND_SIZE: usize = 5;  
   
+/// WiFi 连接状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiState {
+    /// 未连接
+    Disconnected,
+    /// 正在扫描
+    Scanning,
+    /// 正在连接
+    Connecting,
+    /// 已连接（关联成功，但密钥可能尚未安装）
+    Connected,
+    /// 已认证（WPA2 握手完成，控制端口已打开）
+    Authenticated,
+}
+
 /// 连接结果（从 SM_CONNECT_IND 解析）  
 #[derive(Clone, Debug)]  
 pub struct ConnectResult {  
