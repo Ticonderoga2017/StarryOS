@@ -22,16 +22,6 @@ fn main() {
 
     #[cfg(feature = "sg2002")]
     sdio1_probe();
-    // {
-    //     // wireless 完整初始化：aicbsp_init → aicbsp_set_subsys(Wifi, On) → FDRV platform_init
-    //     let mut bsp_info = wireless::bsp::AicBspInfo::default();
-    //     wireless::bsp::aicbsp_init(&mut bsp_info, wireless::bsp::AicBspCpMode::Work).expect("aicbsp_init failed");
-    //     wireless::bsp::aicbsp_set_subsys(wireless::bsp::AicBspSubsys::Wifi, wireless::bsp::AicBspPwrState::On)
-    //         .expect("aicbsp_set_subsys Wifi On failed");
-    //     // 验证完整流程：上电 → SDIO 初始化 → 时钟/4-bit 切换 → 最小 IPC (DBG_MEM_READ) 并等待 CFM
-    //     // 这将验证 MEM_WRITE_CFM 超时是否已通过 寄存器顺序、DMA 边界、4-bit 模式及 RD_FIFO 排空 解决。
-    //     // wireless::bsp::dma_write_minimal_verify().expect("dma_write_minimal_verify failed");
-    // }
 
     let args = CMDLINE
         .iter()
@@ -57,12 +47,18 @@ extern crate axplat_riscv64_visionfive2;
 
 #[cfg(feature = "sg2002")]
 extern crate axplat_riscv64_sg2002;
-use sdhci_cv1800::{CviSdhci, hw_init};  
+#[cfg(feature = "sg2002")]
+use sdhci_cv1800::{CviSdhci, hw_init}; 
+#[cfg(feature = "sg2002")] 
 use aic8800_sdio::SdioHost;  
+#[cfg(feature = "sg2002")]
 use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
+#[cfg(feature = "sg2002")]
 use alloc::sync::Arc;
+#[cfg(feature = "sg2002")]
 use axsync::Mutex;
-use aic8800_fdrv::{bus::{BusState, WifiBus}, cmd_mgr::*, wifi_mgr::*, wpa2::*};
+#[cfg(feature = "sg2002")]
+use aic8800_fdrv::{bus::{BusState, WifiBus}, cmd_mgr::*, wifi_mgr::*, wpa2::*, lmac_msg::CmdError};
 #[cfg(feature = "sg2002")]
 fn sdio1_probe() {   
     // 修正: SD1 主系统总线地址 (非 RTC 域)  
@@ -198,7 +194,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     let rsn_ie = build_wpa2_rsn_ie();  
     let connect_result = connect(  
         bus, vif_idx, target_ssid, &ap.bssid,  
-        ap.center_freq, &rsn_ie, 15000,  
+        ap.center_freq, &rsn_ie, 15000, 
     )?;  
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   
@@ -227,17 +223,27 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
   
                 // 安装 PTK  
                 send_key_add_req(  
-                    bus, 0, connect_result.ap_idx,  
-                    &result.tk, 0, 3, // MAC_CIPHER_CCMP  
-                    0, true, 5000,  
+                        bus,  
+                        vif_idx,                    // vif_idx: u8  
+                        connect_result.ap_idx,      // sta_idx: u8  
+                        true,                       // pairwise: bool  
+                        &result.tk,                 // key: &[u8]  
+                        0,                          // key_idx: u8  
+                        3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                        5000,                       // timeout_ms: u64 
                 )?;  
                 info!("[WPA2] PTK installed");  
   
                 // 安装 GTK  
                 send_key_add_req(  
-                    bus, result.gtk_key_idx, 0xFF,  
-                    &result.gtk, result.gtk_key_idx, 3,  
-                    0, false, 5000,  
+                    bus,  
+                    vif_idx,                    // vif_idx: u8  
+                    0xFF,                       // sta_idx: u8 (0xFF = group key)  
+                    false,                      // pairwise: bool  
+                    &result.gtk,                // key: &[u8]  
+                    result.gtk_key_idx,         // key_idx: u8  
+                    3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                    5000,                       // timeout_ms: u64  
                 )?;  
                 info!("[WPA2] GTK installed");  
   

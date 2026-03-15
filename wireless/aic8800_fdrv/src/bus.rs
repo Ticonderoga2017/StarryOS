@@ -48,6 +48,11 @@ pub struct WifiBus {
     pub data_rx_queue: SpinNoIrq<VecDeque<Vec<u8>>>,
     pub data_rx_pollset: PollSet,
 
+    /// EAPOL 帧队列（rx_thread 识别 ethertype=0x888E 后路由到此）  
+    pub eapol_queue: SpinNoIrq<VecDeque<Vec<u8>>>,  
+    /// EAPOL PollSet（唤醒 wait_for_eapol 等待者）  
+    pub eapol_pollset: PollSet,
+
     /// CMD 响应队列（wifi-rx → CmdMgr）
     pub cmd_rsp_queue: SpinNoIrq<VecDeque<Vec<u8>>>,
     pub cmd_rsp_pollset: PollSet,
@@ -92,6 +97,8 @@ impl WifiBus {
             rx_irq_pending: AtomicBool::new(false),
             data_rx_queue: SpinNoIrq::new(VecDeque::new()),
             data_rx_pollset: PollSet::new(),
+            eapol_queue: SpinNoIrq::new(VecDeque::new()),  
+            eapol_pollset: PollSet::new(),
             cmd_rsp_queue: SpinNoIrq::new(VecDeque::new()), 
             cmd_rsp_pollset: PollSet::new(),
             tx_cfm_queue: SpinNoIrq::new(VecDeque::new()), 
@@ -138,6 +145,9 @@ impl WifiBus {
         self.tx_cfm_pollset.wake();  
         self.sdhci_pollset.wake();
 
+        self.eapol_pollset.wake();  
+        self.eapol_queue.lock().clear();
+        
         self.ind_pollset.wake();
         self.ind_queue.lock().clear();
 

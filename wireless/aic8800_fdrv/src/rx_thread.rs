@@ -248,6 +248,54 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                         }
                     }
                 }
+                SDIO_TYPE_DATA => {
+                    log::info!("[wifi-rx] DATA frame, len={}", pkt_len);  
+  
+                    // RX DATA 帧格式：  
+                    //   [0..60]  hw_rxhdr (60 bytes)  
+                    //   [60..62] padding (2 bytes, SDIO alignment)  
+                    //   [62..]   802.11 data frame 或 Ethernet frame  
+                    //  
+                    // FullMAC 模式下，固件已将 802.11 帧转换为 Ethernet 帧：  
+                    //   [62..68]  dst_mac (6)  
+                    //   [68..74]  src_mac (6)  
+                    //   [74..76]  ethertype (2, big-endian)  
+                    //   [76..]    payload  
+
+                    const RX_HWHRD_LEN: usize = 60;  
+                    const ETH_HDR_OFFSET: usize = RX_HWHRD_LEN + 2; // 62  
+                    const ETH_P_PAE: u16 = 0x888E;  
+  
+                    let data = &buf[offset..offset + pkt_len as usize];  
+
+                    if data.len() >= ETH_HDR_OFFSET + 14 {  
+                        let ethertype = u16::from_be_bytes([  
+                            data[ETH_HDR_OFFSET + 12],  
+                            data[ETH_HDR_OFFSET + 13],  
+                        ]);  
+  
+                        if ethertype == ETH_P_PAE {  
+                            // EAPOL 帧：提取 EAPOL payload（跳过 Ethernet 头）  
+                            let eapol_start = ETH_HDR_OFFSET + 14; // 76  
+                            if data.len() > eapol_start {  
+                                let eapol = data[eapol_start..].to_vec();  
+                                log::info!(  
+                                    "[wifi-rx] EAPOL frame detected, eapol_len={}",  
+                                    eapol.len()  
+                                );  
+                                let mut queue = bus.eapol_queue.lock();  
+                                queue.push_back(eapol);  
+                                drop(queue);  
+                                bus.eapol_pollset.wake();  
+                            }  
+                        } else {  
+                            // 普通 DATA 帧，放入 data_rx_queue  
+                            let mut queue = bus.data_rx_queue.lock();  
+                            queue.push_back(data.to_vec());  
+                            drop(queue);  
+                        }  
+                    }                  
+                }
                 SDIO_TYPE_CFG_DATA_CFM => {  
                     log::info!("[wifi-rx] DATA_CFM frame, len={}", pkt_len);  
                     // TX 确认 → 释放 flow control credits  

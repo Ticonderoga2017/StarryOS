@@ -1,4 +1,5 @@
-use alloc::{collections::vec_deque::VecDeque, sync::Arc};
+use aic8800_sdio::SdioHost;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::poll_fn;
@@ -1209,4 +1210,186 @@ pub fn send_get_mac_addr_req(
         log::error!("[cmd_mgr] MM_GET_MAC_ADDR_CFM too short: {} bytes", rsp.len());  
         Err(CmdError::InvalidResponse)  
     } 
+}
+
+/// 等待 EAPOL 帧（从 eapol_queue 中取出）  
+///  
+/// 返回完整的 EAPOL 帧（从 802.1X Version 字段开始，不含 Ethernet 头）  
+pub fn wait_for_eapol(  
+    bus: &Arc<WifiBus>,  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> {
+    let timeout_ns = timeout_ms * 1_000_000;  
+    let start = axhal::time::monotonic_time_nanos();  
+
+    let result = block_on(poll_fn(|cx| {
+        // 检查超时  
+        let elapsed = axhal::time::monotonic_time_nanos() - start;  
+        if elapsed > timeout_ns {  
+            log::error!("[cmd_mgr] wait_for_eapol timeout ({}ms)", timeout_ms);  
+            return Poll::Ready(Err(CmdError::Timeout));  
+        } 
+
+        // 尝试从 eapol_queue 取出 
+        {
+            let mut queue = bus.eapol_queue.lock();
+            if let Some(eapol) = queue.pop_front() {
+                log::info!(  
+                    "[cmd_mgr] EAPOL frame received: {} bytes",  
+                    eapol.len()  
+                );  
+                return Poll::Ready(Ok(eapol));  
+            }
+        }
+
+        // 注册 waker  
+        bus.eapol_pollset.register(cx.waker()); 
+
+        // 双重检查  
+        {  
+            let mut queue = bus.eapol_queue.lock();  
+            if let Some(eapol) = queue.pop_front() {  
+                return Poll::Ready(Ok(eapol));  
+            }  
+        }
+
+        // 也用 wake_by_ref 做轮询 fallback  
+        cx.waker().wake_by_ref();  
+        Poll::Pending  
+    }));
+
+    result
+}
+
+/// 发送 EAPOL DATA 帧  
+///  
+/// `dst_mac`: AP 的 MAC 地址  
+/// `src_mac`: STA 的 MAC 地址  
+/// `eapol`: 完整的 EAPOL 帧（从 802.1X Version 字段开始）  
+pub fn send_eapol_data_frame(  
+    bus: &Arc<WifiBus>,  
+    dst_mac: &[u8; 6],  
+    src_mac: &[u8; 6],  
+    eapol: &[u8],  
+) -> Result<(), CmdError> {  
+    const SDIO_HEADER_LEN: usize = 4;  
+    const HOSTDESC_SIZE: usize = 28;  
+    const ETH_HEADER_LEN: usize = 14;  
+    const TX_ALIGNMENT: usize = 4; 
+
+    // Ethernet frame = dst(6) + src(6) + ethertype(2) + eapol payload  
+    let eth_frame_len = ETH_HEADER_LEN + eapol.len();  
+  
+    // SDIO payload = hostdesc + ethernet frame  
+    let sdio_payload_len = HOSTDESC_SIZE + eth_frame_len;  
+  
+    // sdio_header[0..1] = payload length (不含 sdio_header 本身)  
+    let raw_len = SDIO_HEADER_LEN + sdio_payload_len;  
+  
+    // 对齐到 TX_ALIGNMENT  
+    let aligned = (raw_len + TX_ALIGNMENT - 1) & !(TX_ALIGNMENT - 1);  
+
+    // 对齐到 SDIOWIFI_FUNC_BLOCKSIZE (512)  
+    let final_len = if aligned % SDIOWIFI_FUNC_BLOCKSIZE != 0 {  
+        let with_tail = aligned + 4; // TAIL_LEN  
+        ((with_tail / SDIOWIFI_FUNC_BLOCKSIZE) + 1) * SDIOWIFI_FUNC_BLOCKSIZE  
+    } else {  
+        aligned  
+    }; 
+
+    let mut buf = vec![0u8; final_len];  
+  
+    // ---- SDIO header [0..4] ----  
+    let sdio_len = sdio_payload_len;  
+    buf[0] = (sdio_len & 0xFF) as u8;  
+    buf[1] = ((sdio_len >> 8) & 0x0F) as u8;  
+    buf[2] = 0x01; // SDIO_TYPE_DATA = 0x00, 但 Linux 用 0x01 for data  
+    buf[3] = 0x00;  
+  
+    // ---- hostdesc [4..32] ----  
+    let hd = &mut buf[SDIO_HEADER_LEN..SDIO_HEADER_LEN + HOSTDESC_SIZE];  
+  
+    // packet_len = ethernet frame length  
+    hd[0..2].copy_from_slice(&(eth_frame_len as u16).to_le_bytes());  
+    // flags_ext = 0  
+    // hostid = 0  
+    // eth_dest_addr [8..14]  
+    hd[8..14].copy_from_slice(dst_mac);  
+    // eth_src_addr [14..20]  
+    hd[14..20].copy_from_slice(src_mac);  
+    // ethertype [20..22] = 0x888E (big-endian in Ethernet, but hostdesc uses LE)  
+    hd[20..22].copy_from_slice(&0x888Eu16.to_be_bytes());  
+    // ac = 0 (BE)  
+    hd[22] = 0;  
+    // tid = 0xFF (non-QoS)  
+    hd[23] = 0xFF;  
+    // vif_idx = 0  
+    hd[24] = 0;  
+    // staid = 0 (AP's sta_idx from SM_CONNECT_IND)  
+    hd[25] = 0;  
+    // flags = 0  
+    hd[26..28].copy_from_slice(&0u16.to_le_bytes());  
+  
+    // ---- Ethernet frame [32..] ----  
+    let eth_start = SDIO_HEADER_LEN + HOSTDESC_SIZE;  
+    buf[eth_start..eth_start + 6].copy_from_slice(dst_mac);  
+    buf[eth_start + 6..eth_start + 12].copy_from_slice(src_mac);  
+    buf[eth_start + 12..eth_start + 14].copy_from_slice(&0x888Eu16.to_be_bytes());  
+    buf[eth_start + 14..eth_start + 14 + eapol.len()].copy_from_slice(eapol);  
+  
+    log::info!(  
+        "[cmd_mgr] sending EAPOL DATA frame: eapol_len={}, total_len={}",  
+        eapol.len(), final_len  
+    );  
+  
+    // 通过 TX 队列发送（复用现有的 tx_thread 路径）  
+    // 但 DATA 帧不走 cmd_pending，需要直接写入 SDIO  
+    // 最简单的方式：直接获取 SDIO 锁并写入  
+    {  
+        let base = bus.sdio_mmio_base.load(core::sync::atomic::Ordering::Acquire);  
+        if base != 0 {  
+            sdhci_cv1800::mask_unmask_card_irq_raw(base, true);  
+        }  
+  
+        // 流控  
+        let mut fc_ok = false;  
+        for _ in 0..50 {  
+            let sdio = bus.sdio.lock();  
+            match sdio.read_byte(1, SDIOWIFI_FLOW_CTRL_REG) {  
+                Ok(fc) if fc & 0x7F != 0 => {  
+                    fc_ok = true;  
+                    break;  
+                }  
+                _ => {}  
+            }  
+            drop(sdio);  
+            for _ in 0..10_000 { core::hint::spin_loop(); }  
+        }  
+  
+        if !fc_ok {  
+            if base != 0 {  
+                sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+            }  
+            log::error!("[cmd_mgr] EAPOL TX flow_ctrl timeout");  
+            return Err(CmdError::Timeout);  
+        }  
+  
+        let sdio = bus.sdio.lock();  
+        if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &buf) {  
+            log::error!("[cmd_mgr] EAPOL TX write_fifo failed: {:?}", e);  
+            drop(sdio);  
+            if base != 0 {  
+                sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+            }  
+            return Err(CmdError::SdioError);  
+        }  
+        drop(sdio);  
+  
+        bus.rx_irq_pollset.wake();  
+        if base != 0 {  
+            sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+        }  
+    }  
+  
+    Ok(())  
 }
