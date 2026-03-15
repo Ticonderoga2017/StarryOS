@@ -26,10 +26,8 @@ fn current_time_ms() -> u64 {
 fn build_cmd_frame(msg_id: u16, dest_task: u16, param: &[u8]) -> Vec<u8> {
     // lmac_msg header (8B) + param  
     let lmac_len = 8 + param.len();
-    // sdio payload = dummy(4) + lmac_msg(8) + param  
-    let sdio_payload_len = DUMMY_WORD_LEN + lmac_len;
     // sdio_header length field = sdio_payload_len + 4 (header itself) 
-    let sdio_len = sdio_payload_len + 4;
+    let sdio_len = DUMMY_WORD_LEN + lmac_len;
     // total raw length = sdio_header(4) + dummy(4) + lmac_msg(8) + param  
     let raw_len = 4 + DUMMY_WORD_LEN + lmac_len;  
 
@@ -120,6 +118,12 @@ pub fn send_cmd_with_cfm_id(
 
     // ---- 构造 SDIO 帧 ----
     let frame = build_cmd_frame(msg_id, dest_id, param);
+
+    log::info!(  
+        "[cmd_mgr] SDIO header: [{:02x}, {:02x}, {:02x}, {:02x}], dummy: [{:02x}, {:02x}, {:02x}, {:02x}]",  
+        frame[0], frame[1], frame[2], frame[3],  
+        frame[4], frame[5], frame[6], frame[7],  
+    );
 
     log::info!("[cmd_mgr] frame built, len={}", frame.len());    
 
@@ -678,7 +682,8 @@ pub fn collect_scan_results(
                     let msg = LmacMsg::from_le_bytes(&queue[i]);
                     if msg.id == SCANU_RESULT_IND 
                         || msg.id == SCANU_START_CFM
-                        || msg.id == SCANU_START_CFM_ADDTIONAL {
+                        || msg.id == SCANU_START_CFM_ADDTIONAL 
+                    {
                         found_idx = Some(i);
                         break;
                     }
@@ -721,12 +726,27 @@ pub fn collect_scan_results(
             let r_rssi = r.rssi;
             if r_rssi > existing.rssi {
                 let old_freq = existing.center_freq;
+                let old_rsn = if r.rsn_ie.is_empty() {
+                    existing.rsn_ie.clone()
+                } else {
+                    Vec::new()
+                };
                 *existing = r;
                 if existing.center_freq == 0 && old_freq != 0 {
                     existing.center_freq = old_freq;
                 }
-            } else if existing.center_freq == 0 && r_freq != 0 {
-                existing.center_freq = r_freq;
+                // 如果新条目没有 RSN IE 但旧条目有，保留旧的  
+                if existing.rsn_ie.is_empty() && !old_rsn.is_empty() {  
+                    existing.rsn_ie = old_rsn;  
+                } 
+            } else {
+                if existing.center_freq == 0 && r_freq != 0 {
+                    existing.center_freq = r_freq;
+                }
+                // 如果现有条目没有 RSN IE 但新条目有，用新的  
+                if existing.rsn_ie.is_empty() && !r.rsn_ie.is_empty() {  
+                    existing.rsn_ie = r.rsn_ie;  
+                } 
             }
         } else {
             deduped.push(r);
@@ -826,6 +846,7 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
     let mut ssid = [0u8; MAC_SSID_LEN];  
     let mut ssid_len: u8 = 0;  
     let mut ds_channel: u8 = 0; // DS Parameter Set 中的 channel  
+    let mut rsn_ie = Vec::new();
 
     let mut ie_offset = 0;  
     while ie_offset + 2 <= ie_data.len() {  
@@ -845,6 +866,13 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
                 if ie_len >= 1 {
                     ds_channel = ie_data[ie_offset + 2];
                 }
+            }
+            0x30 => {  
+                rsn_ie = ie_data[ie_offset..ie_offset + 2 + ie_len].to_vec();  
+                log::info!(  
+                    "[parse] RSN IE ({} bytes): {:02x?}",  
+                    rsn_ie.len(), &rsn_ie  
+                );  
             }
             _ => {}
         }
@@ -875,6 +903,7 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
         capability,  
         beacon_interval,  
         raw_payload: payload.to_vec(),  
+        rsn_ie,
     })  
 }
 
@@ -883,17 +912,36 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
 pub fn wait_for_indication(
     bus: &Arc<WifiBus>,
     target_msg_id: u16,
+    abort_msg_ids: &[u16],
     timeout_ms: u64,
 ) -> Result<Vec<u8>, CmdError> {
     let deadline = axhal::time::monotonic_time_nanos() + timeout_ms as u64 * 1_000_000; 
+    let abort_ids: Vec<u16> = abort_msg_ids.to_vec();  
 
     let result = block_on(poll_fn(|cx| {
         // 超时检查  
         if axhal::time::monotonic_time_nanos() >= deadline {  
+            // 超时时 dump ind_queue 中所有未处理的消息  
+            let queue = bus.ind_queue.lock();  
+            log::error!(  
+                "[wait_ind] TIMEOUT waiting for msg_id=0x{:04x}, ind_queue has {} messages:",  
+                target_msg_id, queue.len()  
+            );  
+            for (i, msg_data) in queue.iter().enumerate() {  
+                if msg_data.len() >= LmacMsg::SIZE {  
+                    let msg = LmacMsg::from_le_bytes(msg_data);  
+                    log::error!(  
+                        "[wait_ind]   [{}] msg_id=0x{:04x}, param_len={}",  
+                        i, msg.id, msg.param_len  
+                    );  
+                } else {  
+                    log::error!("[wait_ind]   [{}] raw_len={} (too short)", i, msg_data.len());  
+                }  
+            } 
             return Poll::Ready(Err(CmdError::Timeout));  
         }  
 
-        // 在 ind_queue 中查找目标 msg_id  
+        // 在 ind_queue 中查找目标 msg_id 或 abort msg_id
         {
             let mut queue = bus.ind_queue.lock();
             for i in 0..queue.len() {
@@ -908,6 +956,42 @@ pub fn wait_for_indication(
                             Vec::new()
                         };
                         return Poll::Ready(Ok(param));
+                    }
+                    // 检查是否是 abort 消息 
+                    if abort_ids.contains(&msg.id) {
+                        let raw = queue.remove(i).unwrap();  
+                        let param_start = LmacMsg::SIZE;  
+                        let param = if raw.len() > param_start {  
+                            &raw[param_start..]  
+                        } else {  
+                            &[]  
+                        };  
+  
+                        match msg.id {  
+                            SM_DISCONNECT_IND => {  
+                                let reason = if param.len() >= 4 {  
+                                    u16::from_le_bytes([param[2], param[3]])  
+                                } else {  
+                                    0xFFFF  
+                                };  
+                                log::error!(  
+                                    "[wait_ind] SM_DISCONNECT_IND received! reason_code={}, param={:02x?}",  
+                                    reason, &param[..param.len().min(16)]  
+                                );  
+                            }  
+                            SM_EXTERNAL_AUTH_REQUIRED_IND => {  
+                                log::error!( "[wait_ind] SM_EXTERNAL_AUTH_REQUIRED_IND received! AP requires SAE/WPA3 external auth, param={:02x?}",  
+                                    &param[..param.len().min(48)]  
+                                );  
+                            }  
+                            _ => {  
+                                log::error!(  
+                                    "[wait_ind] abort msg_id=0x{:04x} received, param={:02x?}",  
+                                    msg.id, &param[..param.len().min(16)]  
+                                );  
+                            }  
+                        }  
+                        return Poll::Ready(Err(CmdError::FirmwareError));
                     }
                 }
             }
@@ -932,6 +1016,15 @@ pub fn wait_for_indication(
                         };  
                         return Poll::Ready(Ok(param));  
                     }  
+
+                    if abort_ids.contains(&msg.id) {  
+                        let raw = queue.remove(i).unwrap();  
+                        log::error!(  
+                            "[wait_ind] abort msg_id=0x{:04x} received (post-register check)",  
+                            msg.id  
+                        );  
+                        return Poll::Ready(Err(CmdError::FirmwareError));  
+                    }
                 }  
             }  
         }
@@ -1027,12 +1120,19 @@ pub fn send_sm_connect_req(
     if ie_len > 0 {  
         param[64..64 + ie_len].copy_from_slice(&ie[..ie_len]);  
     }  
-
+  
+    // 诊断：打印关键字段的原始字节，确认布局正确  
+    log::info!(  
+        "[cmd_mgr] SM_CONNECT_REQ raw: offset48..56={:02x?}, offset56..64={:02x?}",  
+        &param[48..56],  // flags + ethertype + ie_len  
+        &param[56..64],  // listen_interval + dont_wait_bcmc + auth + uapsd + vif + padding  
+    );  
+  
     log::info!(  
         "[cmd_mgr] sending SM_CONNECT_REQ: vif={}, ssid_len={}, auth={}, flags=0x{:08x}, ie_len={}",  
         vif_idx, ssid_len, auth_type, flags, ie_len  
-    );  
-  
+    );
+
     // Linux 驱动等待 SM_CONNECT_CFM (msg_id + 1)  
     send_cmd(bus, SM_CONNECT_REQ, TASK_SM, &param, timeout_ms)     
 }

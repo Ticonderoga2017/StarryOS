@@ -39,7 +39,8 @@ pub fn start(bus: Arc<WifiBus>) {
                     RX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
 
-                let cnt = RX_WAKE_COUNT.load(Ordering::Relaxed);
+                // 打印后重置 RX_WAKE_COUNT，使其反映"自上次处理以来的中断次数"  
+                let cnt = RX_WAKE_COUNT.swap(0, Ordering::Relaxed);  
                 if cnt > 0 {  
                     log::info!("[wifi-rx] woke up (count={})", cnt);  
                 } 
@@ -69,6 +70,9 @@ pub fn start(bus: Arc<WifiBus>) {
 
 /// 读取 SDIO FIFO 中的所有帧并按类型分发
 fn process_rx_frames(bus: &WifiBus) {
+    // SDIO_OTHER_INTERRUPT 重试计数器  
+    let mut other_int_retries = 0u32; 
+
     loop {
         // 在轮询循环中也检查 rx_irq_pending  
         if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {  
@@ -87,44 +91,57 @@ fn process_rx_frames(bus: &WifiBus) {
         };
 
         if block_cnt & SDIO_OTHER_INTERRUPT != 0 {
+            other_int_retries += 1; 
+            if other_int_retries > 3 {  
+                log::warn!(  
+                    "[wifi-rx] SDIO_OTHER_INTERRUPT persists after {} retries, giving up",  
+                    other_int_retries  
+                );  
+                break;  
+            }  
             log::warn!("[wifi-rx] SDIO_OTHER_INTERRUPT (0x{:02x}), re-read", block_cnt);  
             continue;  
         }
+        other_int_retries = 0; // 成功读取后重置
 
         if block_cnt == 0 {
-            let mut found = false;
-            for poll_i in 0..500u32 {
-
-                 // 轮询期间也检查 rx_irq_pending  
-                if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {  
-                    // ISR 触发了，重新读 block_cnt  
-                } 
-
-                let cnt = {
-                    let sdio = bus.sdio.lock();
-                    sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG).unwrap_or(0)
-                };
-
-                if cnt & SDIO_OTHER_INTERRUPT != 0 {
-                    continue;
-                }
-
-                if cnt > 0 {
-                    log::info!(  
-                        "[wifi-rx] block_cnt became {} after {}x100us wait",  
-                        cnt, poll_i + 1  
-                    );  
-                    found = true;  
-                    break; 
-                }
-            }
-
-            if !found  {
-                log::info!("[wifi-rx] block_cnt=0 after 50ms wait, CARD_INT stays masked");  
-                break;
-            }
-            continue;
+            break;
         }
+
+        // if block_cnt == 0 {
+        //     let mut found = false;
+        //     for poll_i in 0..500u32 {
+
+        //          // 轮询期间也检查 rx_irq_pending  
+        //         if bus.rx_irq_pending.swap(false, Ordering::AcqRel) {  
+        //             // ISR 触发了，重新读 block_cnt  
+        //         } 
+
+        //         let cnt = {
+        //             let sdio = bus.sdio.lock();
+        //             sdio.read_byte(1, SDIOWIFI_BLOCK_CNT_REG).unwrap_or(0)
+        //         };
+
+        //         if cnt & SDIO_OTHER_INTERRUPT != 0 {
+        //             continue;
+        //         }
+
+        //         if cnt > 0 {
+        //             log::info!(  
+        //                 "[wifi-rx] block_cnt became {} after {}x100us wait",  
+        //                 cnt, poll_i + 1  
+        //             );  
+        //             found = true;  
+        //             break; 
+        //         }
+        //     }
+
+        //     if !found  {
+        //         log::info!("[wifi-rx] block_cnt=0 after 50ms wait, CARD_INT stays masked");  
+        //         break;
+        //     }
+        //     continue;
+        // }
 
         log::info!("[wifi-rx] block_cnt={}", block_cnt);  
         let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;  
@@ -157,6 +174,7 @@ fn process_rx_frames(bus: &WifiBus) {
 /// CFG 帧：pkt_len 不包含 SDIO header 4 字节  
 ///   advance = roundup(pkt_len, RX_ALIGNMENT) + 4  
 fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
+    const DATA_RX_QUEUE_MAX: usize = 64;
     let mut offset = 0;
 
     while offset + 4 <= buf.len() {
@@ -223,6 +241,9 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                 } else {  
                     // 普通 DATA 帧，放入 data_rx_queue  
                     let mut queue = bus.data_rx_queue.lock();  
+                    if queue.len() >= DATA_RX_QUEUE_MAX {
+                        queue.pop_front(); // 丢弃最旧的帧 
+                    }
                     queue.push_back(data_payload.to_vec());  
                     drop(queue);  
                 } 
@@ -241,7 +262,8 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
             }  
   
             let msg_data = &buf[msg_start..msg_end];  
-            let cfg_subtype = pkt_type & 0x7F;  
+            // let cfg_subtype = pkt_type & 0x7F;  
+            let cfg_subtype = pkt_type;
   
             // 帧间偏移 = roundup(pkt_len, RX_ALIGNMENT) + 4  
             let advance = align_up(pkt_len, RX_ALIGNMENT) + 4;  

@@ -24,16 +24,6 @@ impl LmacMsg {
             pattern: u32::from_le_bytes([data[8], data[9], data[10], data[11]]), 
         }
     }
-
-    // /// 序列化为 8 字节小端序 
-    // pub fn to_le_bytes(&self) -> [u8; 8] {
-    //     let mut buf = [0u8; 8];  
-    //     buf[0..2].copy_from_slice(&self.id.to_le_bytes());  
-    //     buf[2..4].copy_from_slice(&self.dest_id.to_le_bytes());  
-    //     buf[4..6].copy_from_slice(&self.src_id.to_le_bytes());  
-    //     buf[6..8].copy_from_slice(&self.param_len.to_le_bytes());  
-    //     buf 
-    // }
 }
 
 /// 构造宏：LMAC_FIRST_MSG(task) = (task << 10)
@@ -215,6 +205,8 @@ pub struct ScanResult {
     pub beacon_interval: u16,
     /// 原始 802.11 管理帧 payload（用于后续 IE 解析）
     pub raw_payload: Vec<u8>,
+    /// AP 的 RSN IE（含 tag=0x30 + length 头部），空表示开放网络  
+    pub rsn_ie: Vec<u8>, 
 }
 
 // ================================================================  

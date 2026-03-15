@@ -139,7 +139,12 @@ pub fn connect(
     log::info!("[wifi_mgr] SM_CONNECT_CFM OK, waiting for SM_CONNECT_IND...");
 
     // 等待 SM_CONNECT_IND（异步 indication）
-    let ind = wait_for_indication(bus, SM_CONNECT_IND, timeout_ms)?;
+    let ind = wait_for_indication(
+        bus, 
+        SM_CONNECT_IND, 
+         &[SM_DISCONNECT_IND, SM_EXTERNAL_AUTH_REQUIRED_IND], 
+        timeout_ms,
+    )?;
 
     // 解析 SM_CONNECT_IND
     let result = parse_connect_ind(&ind)?;
@@ -167,7 +172,6 @@ pub fn connect(
         // WPA2：控制端口由调用者在握手完成后打开  
         log::info!("[wifi_mgr] WPA2: waiting for handshake before opening control port");  
     }
-    // log::info!("[wifi_mgr] connected, waiting for WPA2 handshake before opening control port");
 
     Ok(result)
 }
@@ -311,7 +315,12 @@ pub fn disconnect(
         log::warn!("[wifi_mgr] SM_DISCONNECT_CFM status={}", cfm[0]); 
     }
 
-    match wait_for_indication(bus, SM_DISCONNECT_IND, 5000) {
+    match wait_for_indication(
+        bus, 
+        SM_DISCONNECT_IND, 
+        &[],
+        5000
+    ) {
         Ok(ind) => {
             if ind.len() >= 4 {
                 let reason = u16::from_le_bytes([ind[0], ind[1]]); 
@@ -356,39 +365,82 @@ pub fn handle_disconnect_ind(param: &[u8]) {
 // 构造 WPA2 RSN IE（用于 SM_CONNECT_REQ）
 // ================================================================
 
-/// 构造最小的 WPA2-PSK RSN IE
-///
-/// RSN IE 格式:
-///   Tag Number: 48 (0x30)
-///   Tag Length: 20
-///   Version: 1
-///   Group Cipher Suite: 00-0F-AC-04 (CCMP)
-///   Pairwise Cipher Suite Count: 1
-///   Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
-///   AKM Suite Count: 1
-///   AKM Suite: 00-0F-AC-02 (PSK)
-///   RSN Capabilities: 0x0000
-pub fn build_wpa2_rsn_ie() -> Vec<u8> {
-    let mut ie = Vec::with_capacity(22);
-    ie.push(0x30);       // Element ID: RSN
-    ie.push(20);         // Length
-    ie.extend_from_slice(&1u16.to_le_bytes()); // Version: 1
+// /// 构造最小的 WPA2-PSK RSN IE
+// ///
+// /// RSN IE 格式:
+// ///   Tag Number: 48 (0x30)
+// ///   Tag Length: 20
+// ///   Version: 1
+// ///   Group Cipher Suite: 00-0F-AC-04 (CCMP)
+// ///   Pairwise Cipher Suite Count: 1
+// ///   Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
+// ///   AKM Suite Count: 1
+// ///   AKM Suite: 00-0F-AC-02 (PSK)
+// ///   RSN Capabilities: 0x0000
+// pub fn build_wpa2_rsn_ie() -> Vec<u8> {
+//     let mut ie = Vec::with_capacity(22);
+//     ie.push(0x30);       // Element ID: RSN
+//     ie.push(20);         // Length
+//     ie.extend_from_slice(&1u16.to_le_bytes()); // Version: 1
 
-    // Group Cipher Suite: 00-0F-AC-04 (CCMP)
-    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
+//     // Group Cipher Suite: 00-0F-AC-04 (CCMP)
+//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
 
-    // Pairwise Cipher Suite Count: 1
-    ie.extend_from_slice(&1u16.to_le_bytes());
-    // Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
-    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
+//     // Pairwise Cipher Suite Count: 1
+//     ie.extend_from_slice(&1u16.to_le_bytes());
+//     // Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
+//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
 
-    // AKM Suite Count: 1
-    ie.extend_from_slice(&1u16.to_le_bytes());
-    // AKM Suite: 00-0F-AC-02 (PSK)
-    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x02]);
+//     // AKM Suite Count: 1
+//     ie.extend_from_slice(&1u16.to_le_bytes());
+//     // AKM Suite: 00-0F-AC-02 (PSK)
+//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x02]);
 
-    // RSN Capabilities: 0x0000
-    ie.extend_from_slice(&0u16.to_le_bytes());
+//     // RSN Capabilities: 0x0000
+//     ie.extend_from_slice(&0u16.to_le_bytes());
 
-    ie
+//     ie
+// }
+
+/// 根据 AP 的 RSN IE 构造 STA 的 RSN IE  
+/// ap_rsn_ie: AP beacon 中的 RSN IE（包含 tag + length 头部）  
+pub fn build_wpa2_rsn_ie_from_ap(ap_rsn_ie: &[u8]) -> Vec<u8> { 
+    // 默认 fallback: TKIP group + CCMP pairwise（最常见的混合模式）
+    let group_cipher = if ap_rsn_ie.len() >= 8 {
+        // ap_rsn_ie[0]=0x30, [1]=len, [2..4]=version, [4..8]=group cipher  
+        &ap_rsn_ie[4..8]  
+    } else {  
+        // 无法解析 AP RSN IE，默认 TKIP（更兼容）  
+        &[0x00, 0x0F, 0xAC, 0x02]  
+    };  
+
+    // 复制 AP 的 RSN Capabilities（最后 2 字节）  
+    let rsn_cap = if ap_rsn_ie.len() >= 22 {  
+        [ap_rsn_ie[20], ap_rsn_ie[21]]  // 直接用 AP 的值  
+    } else {  
+        [0x00, 0x00]  
+    }; 
+    
+    let mut ie = Vec::with_capacity(22);  
+    ie.push(0x30);       // Element ID: RSN  
+    ie.push(20);         // Length  
+    ie.extend_from_slice(&1u16.to_le_bytes()); // Version: 1  
+  
+    // Group Cipher Suite: 从 AP 的 RSN IE 中复制  
+    ie.extend_from_slice(group_cipher);  
+  
+    // Pairwise Cipher Suite Count: 1  
+    ie.extend_from_slice(&1u16.to_le_bytes());  
+    // Pairwise Cipher Suite: CCMP  
+    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);  
+  
+    // AKM Suite Count: 1  
+    ie.extend_from_slice(&1u16.to_le_bytes());  
+    // AKM Suite: PSK  
+    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x02]);  
+  
+    // RSN Capabilities: 0x0000  
+    ie.extend_from_slice(&rsn_cap);  
+  
+    ie 
 }

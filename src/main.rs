@@ -92,6 +92,20 @@ fn sdio1_probe() {
                         Ok(bus) => {  
                             info!("AIC8800 FDRV init SUCCESS");  
                             if let Err(e) = wifi_main(&bus) {  
+                                // 测试固件是否还活着  
+                                match send_cmd(&bus, 0x0004, 0x0000, &[], 3000) {  // MM_VERSION_REQ  
+                                    Ok(rsp) => info!("[probe] firmware alive, MM_VERSION_CFM len={}", rsp.len()),  
+                                    Err(_) => error!("[probe] firmware DEAD - no response to MM_VERSION_REQ"),  
+                                }
+
+                                // dump 所有队列  
+                                let rsp_q = bus.cmd_rsp_queue.lock();  
+                                info!("[debug] cmd_rsp_queue len: {}", rsp_q.len());  
+                                drop(rsp_q);  
+                                let data_q = bus.data_rx_queue.lock();  
+                                info!("[debug] data_rx_queue len: {}", data_q.len());  
+                                drop(data_q);  
+
                                 error!("[wifi] FAILED: {:?}", e);  
                             }                            
 
@@ -180,7 +194,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
   
     // ========== Phase 3: Connect ==========  
     let target_ssid = b"CU_Q2aa";  
-    // let password = b"uuux5cfj";  
+    let password = b"uuux5cfj";  
   
     let ap = find_ap_by_ssid(&results, target_ssid)  
         .ok_or(CmdError::Timeout)?;  // 用 Timeout 代替，或添加新的 CmdError 变体  
@@ -190,88 +204,85 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         ap.bssid[0], ap.bssid[1], ap.bssid[2],  
         ap.bssid[3], ap.bssid[4], ap.bssid[5]  
     );  
+  
+    let rsn_ie = if ap.rsn_ie.is_empty() {  
+        info!("[CONNECT] Open network (no RSN IE from AP)");  
+        Vec::new()  
+    } else {  
+        info!("[CONNECT] AP RSN IE: {:02x?}", &ap.rsn_ie);  
+        let sta_rsn = build_wpa2_rsn_ie_from_ap(&ap.rsn_ie);  
+        info!("[CONNECT] STA RSN IE: {:02x?}", &sta_rsn);  
+        sta_rsn  
+    }; 
 
-    // 开放网络：不传 RSN IE，不做 WPA2 握手  
     let connect_result = connect(  
         bus, vif_idx, target_ssid, &ap.bssid,  
-        ap.center_freq, &[],  // 空 IE = 开放网络  
-        15000,  
+        ap.center_freq, &rsn_ie, 30000, 
     )?;  
-    info!("[CONNECT] SM_CONNECT_IND: ap_idx={}, ch_idx={}, aid={}",  
-        connect_result.ap_idx, connect_result.ch_idx, connect_result.aid);  
+    info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   
-    // 开放网络不需要 WPA2 握手，连接完成  
-    info!("[wifi] Open network connected successfully!");  
+    // ========== Phase 4: WPA2 Handshake ==========  
+    let mut handshake = Wpa2Handshake::new(  
+        password,  
+        target_ssid,  
+        &ap.bssid,     // AA (Authenticator Address)  
+        &sta_mac,      // SPA (Supplicant Address)  
+        &rsn_ie,  
+    );  
   
-    // let rsn_ie = build_wpa2_rsn_ie();  
-    // let connect_result = connect(  
-    //     bus, vif_idx, target_ssid, &ap.bssid,  
-    //     ap.center_freq, &rsn_ie, 15000, 
-    // )?;  
-    // info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
+    loop {  
+        let eapol = wait_for_eapol(bus, 10000)?;  
+        info!("[WPA2] Received EAPOL frame: {} bytes", eapol.len());  
   
-    // // ========== Phase 4: WPA2 Handshake ==========  
-    // let mut handshake = Wpa2Handshake::new(  
-    //     password,  
-    //     target_ssid,  
-    //     &ap.bssid,     // AA (Authenticator Address)  
-    //     &sta_mac,      // SPA (Supplicant Address)  
-    //     &rsn_ie,  
-    // );  
+        match handshake.process_eapol(&eapol) {  
+            Ok(HandshakeAction::SendM2(m2)) => {  
+                info!("[WPA2] Sending M2: {} bytes", m2.len());  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
+            }  
+            Ok(HandshakeAction::Completed(result)) => {  
+                // 发送 M4  
+                info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
   
-    // loop {  
-    //     let eapol = wait_for_eapol(bus, 10000)?;  
-    //     info!("[WPA2] Received EAPOL frame: {} bytes", eapol.len());  
+                // 安装 PTK  
+                send_key_add_req(  
+                        bus,  
+                        vif_idx,                    // vif_idx: u8  
+                        connect_result.ap_idx,      // sta_idx: u8  
+                        true,                       // pairwise: bool  
+                        &result.tk,                 // key: &[u8]  
+                        0,                          // key_idx: u8  
+                        3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                        5000,                       // timeout_ms: u64 
+                )?;  
+                info!("[WPA2] PTK installed");  
   
-    //     match handshake.process_eapol(&eapol) {  
-    //         Ok(HandshakeAction::SendM2(m2)) => {  
-    //             info!("[WPA2] Sending M2: {} bytes", m2.len());  
-    //             send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
-    //         }  
-    //         Ok(HandshakeAction::Completed(result)) => {  
-    //             // 发送 M4  
-    //             info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
-    //             send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
+                // 安装 GTK  
+                send_key_add_req(  
+                    bus,  
+                    vif_idx,                    // vif_idx: u8  
+                    0xFF,                       // sta_idx: u8 (0xFF = group key)  
+                    false,                      // pairwise: bool  
+                    &result.gtk,                // key: &[u8]  
+                    result.gtk_key_idx,         // key_idx: u8  
+                    3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                    5000,                       // timeout_ms: u64  
+                )?;  
+                info!("[WPA2] GTK installed");  
   
-    //             // 安装 PTK  
-    //             send_key_add_req(  
-    //                     bus,  
-    //                     vif_idx,                    // vif_idx: u8  
-    //                     connect_result.ap_idx,      // sta_idx: u8  
-    //                     true,                       // pairwise: bool  
-    //                     &result.tk,                 // key: &[u8]  
-    //                     0,                          // key_idx: u8  
-    //                     3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
-    //                     5000,                       // timeout_ms: u64 
-    //             )?;  
-    //             info!("[WPA2] PTK installed");  
-  
-    //             // 安装 GTK  
-    //             send_key_add_req(  
-    //                 bus,  
-    //                 vif_idx,                    // vif_idx: u8  
-    //                 0xFF,                       // sta_idx: u8 (0xFF = group key)  
-    //                 false,                      // pairwise: bool  
-    //                 &result.gtk,                // key: &[u8]  
-    //                 result.gtk_key_idx,         // key_idx: u8  
-    //                 3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
-    //                 5000,                       // timeout_ms: u64  
-    //             )?;  
-    //             info!("[WPA2] GTK installed");  
-  
-    //             // 打开控制端口  
-    //             send_set_control_port_req(  
-    //                 bus, connect_result.ap_idx, true, 5000,  
-    //             )?;  
-    //             info!("[WPA2] Control port opened, connected!");  
-    //             break;  
-    //         }  
-    //         Err(e) => {  
-    //             error!("[WPA2] Handshake error: {:?}", e);  
-    //             break;  
-    //         }  
-    //     }  
-    // }  
+                // 打开控制端口  
+                send_set_control_port_req(  
+                    bus, connect_result.ap_idx, true, 5000,  
+                )?;  
+                info!("[WPA2] Control port opened, connected!");  
+                break;  
+            }  
+            Err(e) => { 
+                error!("[WPA2] Handshake error: {:?}", e);  
+                break;  
+            }  
+        }  
+    }  
   
     Ok(())  
 }

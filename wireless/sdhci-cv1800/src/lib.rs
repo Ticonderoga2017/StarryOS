@@ -11,13 +11,38 @@ use crate::{hw_init::sdio1_hw_init, regs::*};
 /// 清除/恢复 NORM_INT_SIG_EN 中的 CARD_INT 位  
 pub fn mask_unmask_card_irq_raw(base: usize, mask: bool) {  
     unsafe {  
-        let addr = base.wrapping_add(SDHCI_NORM_INT_SIG_EN as usize);
-        let sig = if mask {
-            read_volatile(addr as *const u16) & !NORM_INT_CARD_INT
-        } else {
-            read_volatile(addr as *const u16) | NORM_INT_CARD_INT
-        };
+        let addr = base + SDHCI_NORM_INT_SIG_EN as usize;
+        
+        // fence w,o — 确保之前的普通内存写入在 MMIO 读取之前完成 
+        core::arch::asm!("fence w,o", options(nostack, preserves_flags)); 
+
+        let cur = read_volatile(addr as *const u16);  
+  
+        // fence i,r — 确保 MMIO 读取在后续操作之前完成  
+        core::arch::asm!("fence i,r", options(nostack, preserves_flags));  
+
+        let sig = if mask {  
+            cur & !NORM_INT_CARD_INT  
+        } else {  
+            cur | NORM_INT_CARD_INT  
+        }; 
+
+        // fence w,o — 确保之前的操作在 MMIO 写入之前完成  
+        core::arch::asm!("fence w,o", options(nostack, preserves_flags));  
+  
         write_volatile(addr as *mut u16, sig);  
+  
+        // fence o,io — 确保 MMIO 写入对硬件可见  
+        core::arch::asm!("fence o,io", options(nostack, preserves_flags));  
+
+        // 验证写入是否生效  
+        let readback = core::ptr::read_volatile(addr as *const u16);  
+        if !mask && (readback & NORM_INT_CARD_INT) == 0 {  
+            log::warn!(  
+                "[sdhci] CARD_INT unmask FAILED: wrote 0x{:04x}, readback 0x{:04x}",  
+                sig, readback  
+            );  
+        } 
     }  
 }  
 
