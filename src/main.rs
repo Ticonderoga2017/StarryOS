@@ -57,17 +57,15 @@ extern crate axplat_riscv64_visionfive2;
 
 #[cfg(feature = "sg2002")]
 extern crate axplat_riscv64_sg2002;
-
+use sdhci_cv1800::{CviSdhci, hw_init};  
+use aic8800_sdio::SdioHost;  
+use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
+use alloc::sync::Arc;
+use axsync::Mutex;
+use aic8800_fdrv::{bus::{BusState, WifiBus}, cmd_mgr::*, wifi_mgr::*, wpa2::*};
 #[cfg(feature = "sg2002")]
-fn sdio1_probe() {
-    use sdhci_cv1800::{CviSdhci, hw_init};  
-    use aic8800_sdio::SdioHost;  
-    use aic8800_fw::{chip_id::ChipVariant, firmware_init};  
-    use alloc::sync::Arc;
-    use axsync::Mutex;
-    use aic8800_fdrv::{bus::{BusState, WifiBus}, cmd_mgr::*, wifi_mgr::*};
-  
-   // 修正: SD1 主系统总线地址 (非 RTC 域)  
+fn sdio1_probe() {   
+    // 修正: SD1 主系统总线地址 (非 RTC 域)  
     // 内存映射: 0x04320000 - 0x0432FFFF = SD1  
     // Linux DTS: wifi-sd@4320000  
     const SDIO1_PADDR: usize = 0x0432_0000;  
@@ -97,83 +95,9 @@ fn sdio1_probe() {
                     match aic8800_fdrv::init(sdio1) {  
                         Ok(bus) => {  
                             info!("AIC8800 FDRV init SUCCESS");  
-                            // 阶段 4 验证: 发送 MM_VERSION_REQ  
-                            match aic8800_fdrv::cmd_mgr::send_cmd(  
-                                &bus, 0x0004, 0x0000, &[], 6000  
-                            ) {  
-                                Ok(rsp) => info!("[VERIFY-4] MM_VERSION_CFM OK, len={}", rsp.len()),  
-                                Err(e) => error!("[VERIFY-4] MM_VERSION_REQ FAILED: {:?}", e),  
-                            }  
-
-                            // ========== Phase: LMAC Configuration ==========
-                            info!("========== LMAC Config Start ==========");
-                            
-                            // 1. TX Power Index
-                            match send_txpwr_idx_req(&bus, 6000) {
-                                Ok(_) => info!("[LMAC] txpwr_idx OK"),
-                                Err(e) => error!("[LMAC] txpwr_idx FAILED: {:?}", e),
-                            }
-
-                            // 2. TX Power Offset
-                            match send_txpwr_ofst_req(&bus, 6000) {
-                                Ok(_) => info!("[LMAC] txpwr_ofst OK"),
-                                Err(e) => error!("[LMAC] txpwr_ofst FAILED: {:?}", e),
-                            }
-
-                            // 3. RF Calibration
-                            match send_rf_calib_req(&bus, 10000) {
-                                Ok(_) => info!("[LMAC] rf_calib OK"),
-                                Err(e) => error!("[LMAC] rf_calib FAILED: {:?}", e),
-                            }
-
-                            // 4. ME Config (HT capabilities)
-                            match send_me_config_req(&bus, 6000) {
-                                Ok(_) => info!("[LMAC] me_config OK"),
-                                Err(e) => error!("[LMAC] me_config FAILED: {:?}", e),
-                            }
-
-                            // 5. ME Channel Config (2.4GHz channels)
-                            match send_me_chan_config_req(&bus, 6000) {
-                                Ok(_) => info!("[LMAC] me_chan_config OK"),
-                                Err(e) => error!("[LMAC] me_chan_config FAILED: {:?}", e),
-                            }
-
-                            // 6. MM_START (启动 MAC)
-                            match send_mm_start_req(&bus, 6000) {
-                                Ok(_) => info!("[LMAC] mm_start OK"),
-                                Err(e) => error!("[LMAC] mm_start FAILED: {:?}", e),
-                            }
-
-                            // 7. MM_ADD_IF (创建 STA VIF)
-                            // 使用固定 MAC 地址（可从 MM_GET_MAC_ADDR_REQ 获取）
-                            let mac_addr: [u8; 6] = [0x88, 0x00, 0x33, 0x88, 0x00, 0x01];
-                            match send_mm_add_if_req(&bus, &mac_addr, 6000) {
-                                Ok(vif_idx) => info!("[LMAC] add_if OK: vif_index={}", vif_idx),
-                                Err(e) => error!("[LMAC] add_if FAILED: {:?}", e),
-                            }
-
-                            info!("========== LMAC Config End ==========");
-
-                            match scan(&bus, 0, None, 20000) {
-                                Ok(results) => {  
-                                    info!("[SCAN] Found {} APs", results.len());  
-                                    for (i, ap) in results.iter().enumerate() {  
-                                        let ssid = core::str::from_utf8(&ap.ssid[..ap.ssid_len as usize])  
-                                            .unwrap_or("<non-utf8>");  
-                                        info!("  [{}] \"{}\" rssi={} freq={}", i, ssid, ap.rssi, ap.center_freq);  
-                                    }  
-                                }  
-                                Err(e) => error!("[SCAN] FAILED: {:?}", e),  
-                            }
-
-                            // let target_ssid = b"midea_db_0467";  
-                            // if let Some(ap) = find_ap_by_ssid(&results, target_ssid) {  
-                            //     let rsn_ie = build_wpa2_rsn_ie();  
-                            //     match connect(&bus, 0, target_ssid, &ap.bssid, ap.center_freq, &rsn_ie, 15000) {  
-                            //         Ok(result) => info!("[CONNECT] OK: ap_idx={}, aid={}", result.ap_idx, result.aid),  
-                            //         Err(e) => error!("[CONNECT] FAILED: {:?}", e),  
-                            //     }  
-                            // }
+                            if let Err(e) = wifi_main(&bus) {  
+                                error!("[wifi] FAILED: {:?}", e);  
+                            }                            
 
                             bus.dump_status(); // 打印完整状态  
                             core::mem::forget(bus); // 临时 leak                              
@@ -192,4 +116,144 @@ fn sdio1_probe() {
     }  
   
     info!("========== SDIO1 Probe End =========="); 
+}
+
+#[cfg(feature = "sg2002")]
+fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {  
+    // ========== Phase 1: LMAC Configuration ==========  
+    info!("========== LMAC Config Start ==========");  
+  
+    // MM_VERSION_REQ  
+    let rsp = send_cmd(bus, 0x0004, 0x0000, &[], 6000)?;  
+    info!("[VERIFY] MM_VERSION_CFM OK, len={}", rsp.len());  
+  
+    // TX Power Index  
+    send_txpwr_idx_req(bus, 6000)?;  
+    info!("[LMAC] txpwr_idx OK");  
+  
+    // TX Power Offset  
+    send_txpwr_ofst_req(bus, 6000)?;  
+    info!("[LMAC] txpwr_ofst OK");  
+  
+    // RF Calibration  
+    send_rf_calib_req(bus, 10000)?;  
+    info!("[LMAC] rf_calib OK");  
+  
+    // ME Config  
+    send_me_config_req(bus, 6000)?;  
+    info!("[LMAC] me_config OK");  
+  
+    // ME Channel Config  
+    send_me_chan_config_req(bus, 6000)?;  
+    info!("[LMAC] me_chan_config OK");  
+  
+    // MM_START  
+    send_mm_start_req(bus, 6000)?;  
+    info!("[LMAC] mm_start OK");  
+  
+    // 获取 MAC 地址（需要在 cmd_mgr.rs 中实现 send_get_mac_addr_req）  
+    let sta_mac = send_get_mac_addr_req(bus, 5000)?;  
+    info!(  
+        "[LMAC] MAC addr: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        sta_mac[0], sta_mac[1], sta_mac[2],  
+        sta_mac[3], sta_mac[4], sta_mac[5]  
+    );  
+  
+    // 检查 MAC 是否全零，fallback 到默认值  
+    let sta_mac = if sta_mac == [0u8; 6] {  
+        warn!("[LMAC] MAC is all zeros, using default");  
+        [0x00, 0x6F, 0x6F, 0x6F, 0x6F, 0x00]  
+    } else {  
+        sta_mac  
+    };  
+  
+    // MM_ADD_IF（使用真实 MAC）  
+    let vif_idx = send_mm_add_if_req(bus, &sta_mac, 6000)?;  
+    info!("[LMAC] add_if OK: vif_index={}", vif_idx);  
+  
+    info!("========== LMAC Config End ==========");  
+  
+    // ========== Phase 2: Scan ==========  
+    let results = scan(bus, vif_idx, None, 20000)?;  
+    info!("[SCAN] Found {} APs", results.len());  
+    for (i, ap) in results.iter().enumerate() {  
+        let ssid = core::str::from_utf8(&ap.ssid[..ap.ssid_len as usize])  
+            .unwrap_or("<non-utf8>");  
+        info!("  [{}] \"{}\" rssi={} freq={}", i, ssid, ap.rssi, ap.center_freq);  
+    }  
+  
+    // ========== Phase 3: Connect ==========  
+    let target_ssid = b"CU_Q2aa";  
+    let password = b"uuux5cfj";  
+  
+    let ap = find_ap_by_ssid(&results, target_ssid)  
+        .ok_or(CmdError::Timeout)?;  // 用 Timeout 代替，或添加新的 CmdError 变体  
+    info!(  
+        "[CONNECT] Target AP: freq={}, bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        ap.center_freq,  
+        ap.bssid[0], ap.bssid[1], ap.bssid[2],  
+        ap.bssid[3], ap.bssid[4], ap.bssid[5]  
+    );  
+  
+    let rsn_ie = build_wpa2_rsn_ie();  
+    let connect_result = connect(  
+        bus, vif_idx, target_ssid, &ap.bssid,  
+        ap.center_freq, &rsn_ie, 15000,  
+    )?;  
+    info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
+  
+    // ========== Phase 4: WPA2 Handshake ==========  
+    let mut handshake = Wpa2Handshake::new(  
+        password,  
+        target_ssid,  
+        &ap.bssid,     // AA (Authenticator Address)  
+        &sta_mac,      // SPA (Supplicant Address)  
+        &rsn_ie,  
+    );  
+  
+    loop {  
+        let eapol = wait_for_eapol(bus, 10000)?;  
+        info!("[WPA2] Received EAPOL frame: {} bytes", eapol.len());  
+  
+        match handshake.process_eapol(&eapol) {  
+            Ok(HandshakeAction::SendM2(m2)) => {  
+                info!("[WPA2] Sending M2: {} bytes", m2.len());  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
+            }  
+            Ok(HandshakeAction::Completed(result)) => {  
+                // 发送 M4  
+                info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
+  
+                // 安装 PTK  
+                send_key_add_req(  
+                    bus, 0, connect_result.ap_idx,  
+                    &result.tk, 0, 3, // MAC_CIPHER_CCMP  
+                    0, true, 5000,  
+                )?;  
+                info!("[WPA2] PTK installed");  
+  
+                // 安装 GTK  
+                send_key_add_req(  
+                    bus, result.gtk_key_idx, 0xFF,  
+                    &result.gtk, result.gtk_key_idx, 3,  
+                    0, false, 5000,  
+                )?;  
+                info!("[WPA2] GTK installed");  
+  
+                // 打开控制端口  
+                send_set_control_port_req(  
+                    bus, connect_result.ap_idx, true, 5000,  
+                )?;  
+                info!("[WPA2] Control port opened, connected!");  
+                break;  
+            }  
+            Err(e) => {  
+                error!("[WPA2] Handshake error: {:?}", e);  
+                break;  
+            }  
+        }  
+    }  
+  
+    Ok(())  
 }

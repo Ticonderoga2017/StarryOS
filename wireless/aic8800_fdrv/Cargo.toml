@@ -14,3 +14,9 @@ axsync = { workspace = true }
 axtask = { workspace = true }
 axhal = { workspace = true }
 axplat = { version = "0.3", git = "https://github.com/arceos-org/axplat_crates.git", tag = "dev-v03", features = ["irq"] }
+# 添加 crypto 依赖
+hmac = { version = "0.12", default-features = false }  
+sha1 = { version = "0.10", default-features = false }  
+digest = { version = "0.10", default-features = false }  
+aes = { version = "0.8", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false }

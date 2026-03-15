@@ -1181,3 +1181,32 @@ pub fn send_set_control_port_req(
   
     send_cmd(bus, ME_SET_CONTROL_PORT_REQ, TASK_ME, &param, timeout_ms)  
 }
+
+/// MM_GET_MAC_ADDR_REQ / MM_GET_MAC_ADDR_CFM  
+/// 参考 Linux: rwnx_send_get_macaddr_req (rwnx_msg_tx.c:1334-1355)  
+///  
+/// mm_get_mac_addr_req: u32 get = 1;  (4 bytes)  
+/// mm_get_mac_addr_cfm: u8 mac_addr[6];  (6 bytes)  
+pub fn send_get_mac_addr_req(  
+    bus: &Arc<WifiBus>,  
+    timeout_ms: u64,  
+) -> Result<[u8; 6], CmdError> {
+    let param = 1u32.to_le_bytes(); // get = 1 
+
+    log::info!("[cmd_mgr] sending MM_GET_MAC_ADDR_REQ");  
+  
+    let rsp = send_cmd(bus, MM_GET_MAC_ADDR_REQ, TASK_MM, &param, timeout_ms)?;  
+  
+    if rsp.len() >= 6 {  
+        let mut mac = [0u8; 6];  
+        mac.copy_from_slice(&rsp[..6]);  
+        log::info!(  
+            "[cmd_mgr] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]  
+        );  
+        Ok(mac)  
+    } else {  
+        log::error!("[cmd_mgr] MM_GET_MAC_ADDR_CFM too short: {} bytes", rsp.len());  
+        Err(CmdError::InvalidResponse)  
+    } 
+}
