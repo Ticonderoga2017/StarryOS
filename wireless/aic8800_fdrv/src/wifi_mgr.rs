@@ -110,7 +110,12 @@ pub fn connect(
     // 构造 flags
     // WPA_WPA2_IN_USE: 使用 WPA/WPA2
     // 不设 CONTROL_PORT_HOST: 让固件自行处理 EAPOL
-    let flags: u32 = WPA_WPA2_IN_USE | CONTROL_PORT_HOST;
+    // let flags: u32 = WPA_WPA2_IN_USE | CONTROL_PORT_HOST;
+    let flags: u32 = if wpa2_ie.is_empty() {
+        0
+    } else {
+        WPA_WPA2_IN_USE | CONTROL_PORT_HOST
+    };
 
     // 发送 SM_CONNECT_REQ
     let cfm = send_sm_connect_req(
@@ -154,7 +159,15 @@ pub fn connect(
 
     // WPA2 模式下不在此处打开控制端口  
     // 控制端口应在 WPA2 四次握手完成、密钥安装后由调用者打开  
-    log::info!("[wifi_mgr] connected, waiting for WPA2 handshake before opening control port");
+    if wpa2_ie.is_empty() {  
+        // 开放网络：直接打开控制端口  
+        send_set_control_port_req(bus, result.ap_idx, true, 5000)?;  
+        log::info!("[wifi_mgr] open network: control port opened for sta_idx={}", result.ap_idx);  
+    } else {  
+        // WPA2：控制端口由调用者在握手完成后打开  
+        log::info!("[wifi_mgr] WPA2: waiting for handshake before opening control port");  
+    }
+    // log::info!("[wifi_mgr] connected, waiting for WPA2 handshake before opening control port");
 
     Ok(result)
 }

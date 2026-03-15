@@ -180,7 +180,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
   
     // ========== Phase 3: Connect ==========  
     let target_ssid = b"CU_Q2aa";  
-    let password = b"uuux5cfj";  
+    // let password = b"uuux5cfj";  
   
     let ap = find_ap_by_ssid(&results, target_ssid)  
         .ok_or(CmdError::Timeout)?;  // 用 Timeout 代替，或添加新的 CmdError 变体  
@@ -190,76 +190,88 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         ap.bssid[0], ap.bssid[1], ap.bssid[2],  
         ap.bssid[3], ap.bssid[4], ap.bssid[5]  
     );  
-  
-    let rsn_ie = build_wpa2_rsn_ie();  
+
+    // 开放网络：不传 RSN IE，不做 WPA2 握手  
     let connect_result = connect(  
         bus, vif_idx, target_ssid, &ap.bssid,  
-        ap.center_freq, &rsn_ie, 15000, 
+        ap.center_freq, &[],  // 空 IE = 开放网络  
+        15000,  
     )?;  
-    info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
+    info!("[CONNECT] SM_CONNECT_IND: ap_idx={}, ch_idx={}, aid={}",  
+        connect_result.ap_idx, connect_result.ch_idx, connect_result.aid);  
   
-    // ========== Phase 4: WPA2 Handshake ==========  
-    let mut handshake = Wpa2Handshake::new(  
-        password,  
-        target_ssid,  
-        &ap.bssid,     // AA (Authenticator Address)  
-        &sta_mac,      // SPA (Supplicant Address)  
-        &rsn_ie,  
-    );  
+    // 开放网络不需要 WPA2 握手，连接完成  
+    info!("[wifi] Open network connected successfully!");  
   
-    loop {  
-        let eapol = wait_for_eapol(bus, 10000)?;  
-        info!("[WPA2] Received EAPOL frame: {} bytes", eapol.len());  
+    // let rsn_ie = build_wpa2_rsn_ie();  
+    // let connect_result = connect(  
+    //     bus, vif_idx, target_ssid, &ap.bssid,  
+    //     ap.center_freq, &rsn_ie, 15000, 
+    // )?;  
+    // info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   
-        match handshake.process_eapol(&eapol) {  
-            Ok(HandshakeAction::SendM2(m2)) => {  
-                info!("[WPA2] Sending M2: {} bytes", m2.len());  
-                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
-            }  
-            Ok(HandshakeAction::Completed(result)) => {  
-                // 发送 M4  
-                info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
-                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
+    // // ========== Phase 4: WPA2 Handshake ==========  
+    // let mut handshake = Wpa2Handshake::new(  
+    //     password,  
+    //     target_ssid,  
+    //     &ap.bssid,     // AA (Authenticator Address)  
+    //     &sta_mac,      // SPA (Supplicant Address)  
+    //     &rsn_ie,  
+    // );  
   
-                // 安装 PTK  
-                send_key_add_req(  
-                        bus,  
-                        vif_idx,                    // vif_idx: u8  
-                        connect_result.ap_idx,      // sta_idx: u8  
-                        true,                       // pairwise: bool  
-                        &result.tk,                 // key: &[u8]  
-                        0,                          // key_idx: u8  
-                        3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
-                        5000,                       // timeout_ms: u64 
-                )?;  
-                info!("[WPA2] PTK installed");  
+    // loop {  
+    //     let eapol = wait_for_eapol(bus, 10000)?;  
+    //     info!("[WPA2] Received EAPOL frame: {} bytes", eapol.len());  
   
-                // 安装 GTK  
-                send_key_add_req(  
-                    bus,  
-                    vif_idx,                    // vif_idx: u8  
-                    0xFF,                       // sta_idx: u8 (0xFF = group key)  
-                    false,                      // pairwise: bool  
-                    &result.gtk,                // key: &[u8]  
-                    result.gtk_key_idx,         // key_idx: u8  
-                    3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
-                    5000,                       // timeout_ms: u64  
-                )?;  
-                info!("[WPA2] GTK installed");  
+    //     match handshake.process_eapol(&eapol) {  
+    //         Ok(HandshakeAction::SendM2(m2)) => {  
+    //             info!("[WPA2] Sending M2: {} bytes", m2.len());  
+    //             send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
+    //         }  
+    //         Ok(HandshakeAction::Completed(result)) => {  
+    //             // 发送 M4  
+    //             info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
+    //             send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
   
-                // 打开控制端口  
-                send_set_control_port_req(  
-                    bus, connect_result.ap_idx, true, 5000,  
-                )?;  
-                info!("[WPA2] Control port opened, connected!");  
-                break;  
-            }  
-            Err(e) => {  
-                error!("[WPA2] Handshake error: {:?}", e);  
-                break;  
-            }  
-        }  
-    }  
+    //             // 安装 PTK  
+    //             send_key_add_req(  
+    //                     bus,  
+    //                     vif_idx,                    // vif_idx: u8  
+    //                     connect_result.ap_idx,      // sta_idx: u8  
+    //                     true,                       // pairwise: bool  
+    //                     &result.tk,                 // key: &[u8]  
+    //                     0,                          // key_idx: u8  
+    //                     3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+    //                     5000,                       // timeout_ms: u64 
+    //             )?;  
+    //             info!("[WPA2] PTK installed");  
+  
+    //             // 安装 GTK  
+    //             send_key_add_req(  
+    //                 bus,  
+    //                 vif_idx,                    // vif_idx: u8  
+    //                 0xFF,                       // sta_idx: u8 (0xFF = group key)  
+    //                 false,                      // pairwise: bool  
+    //                 &result.gtk,                // key: &[u8]  
+    //                 result.gtk_key_idx,         // key_idx: u8  
+    //                 3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+    //                 5000,                       // timeout_ms: u64  
+    //             )?;  
+    //             info!("[WPA2] GTK installed");  
+  
+    //             // 打开控制端口  
+    //             send_set_control_port_req(  
+    //                 bus, connect_result.ap_idx, true, 5000,  
+    //             )?;  
+    //             info!("[WPA2] Control port opened, connected!");  
+    //             break;  
+    //         }  
+    //         Err(e) => {  
+    //             error!("[WPA2] Handshake error: {:?}", e);  
+    //             break;  
+    //         }  
+    //     }  
+    // }  
   
     Ok(())  
 }
