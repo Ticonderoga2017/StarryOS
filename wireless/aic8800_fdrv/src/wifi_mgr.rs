@@ -114,7 +114,7 @@ pub fn connect(
     let flags: u32 = if wpa2_ie.is_empty() {
         0
     } else {
-        WPA_WPA2_IN_USE | CONTROL_PORT_HOST
+        WPA_WPA2_IN_USE | CONTROL_PORT_HOST | CONTROL_PORT_NO_ENC  
     };
 
     // 发送 SM_CONNECT_REQ
@@ -365,42 +365,42 @@ pub fn handle_disconnect_ind(param: &[u8]) {
 // 构造 WPA2 RSN IE（用于 SM_CONNECT_REQ）
 // ================================================================
 
-// /// 构造最小的 WPA2-PSK RSN IE
-// ///
-// /// RSN IE 格式:
-// ///   Tag Number: 48 (0x30)
-// ///   Tag Length: 20
-// ///   Version: 1
-// ///   Group Cipher Suite: 00-0F-AC-04 (CCMP)
-// ///   Pairwise Cipher Suite Count: 1
-// ///   Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
-// ///   AKM Suite Count: 1
-// ///   AKM Suite: 00-0F-AC-02 (PSK)
-// ///   RSN Capabilities: 0x0000
-// pub fn build_wpa2_rsn_ie() -> Vec<u8> {
-//     let mut ie = Vec::with_capacity(22);
-//     ie.push(0x30);       // Element ID: RSN
-//     ie.push(20);         // Length
-//     ie.extend_from_slice(&1u16.to_le_bytes()); // Version: 1
+/// 构造最小的 WPA2-PSK RSN IE
+///
+/// RSN IE 格式:
+///   Tag Number: 48 (0x30)
+///   Tag Length: 20
+///   Version: 1
+///   Group Cipher Suite: 00-0F-AC-04 (CCMP)
+///   Pairwise Cipher Suite Count: 1
+///   Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
+///   AKM Suite Count: 1
+///   AKM Suite: 00-0F-AC-02 (PSK)
+///   RSN Capabilities: 0x0000
+pub fn build_wpa2_rsn_ie() -> Vec<u8> {
+    let mut ie = Vec::with_capacity(22);
+    ie.push(0x30);       // Element ID: RSN
+    ie.push(20);         // Length
+    ie.extend_from_slice(&1u16.to_le_bytes()); // Version: 1
 
-//     // Group Cipher Suite: 00-0F-AC-04 (CCMP)
-//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
+    // Group Cipher Suite: 00-0F-AC-04 (CCMP)
+    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
 
-//     // Pairwise Cipher Suite Count: 1
-//     ie.extend_from_slice(&1u16.to_le_bytes());
-//     // Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
-//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
+    // Pairwise Cipher Suite Count: 1
+    ie.extend_from_slice(&1u16.to_le_bytes());
+    // Pairwise Cipher Suite: 00-0F-AC-04 (CCMP)
+    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x04]);
 
-//     // AKM Suite Count: 1
-//     ie.extend_from_slice(&1u16.to_le_bytes());
-//     // AKM Suite: 00-0F-AC-02 (PSK)
-//     ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x02]);
+    // AKM Suite Count: 1
+    ie.extend_from_slice(&1u16.to_le_bytes());
+    // AKM Suite: 00-0F-AC-02 (PSK)
+    ie.extend_from_slice(&[0x00, 0x0F, 0xAC, 0x02]);
 
-//     // RSN Capabilities: 0x0000
-//     ie.extend_from_slice(&0u16.to_le_bytes());
+    // RSN Capabilities: 0x0000
+    ie.extend_from_slice(&0u16.to_le_bytes());
 
-//     ie
-// }
+    ie
+}
 
 /// 根据 AP 的 RSN IE 构造 STA 的 RSN IE  
 /// ap_rsn_ie: AP beacon 中的 RSN IE（包含 tag + length 头部）  

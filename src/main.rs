@@ -205,19 +205,23 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         ap.bssid[3], ap.bssid[4], ap.bssid[5]  
     );  
   
-    let rsn_ie = if ap.rsn_ie.is_empty() {  
-        info!("[CONNECT] Open network (no RSN IE from AP)");  
-        Vec::new()  
-    } else {  
+    let rsn_ie = if !ap.rsn_ie.is_empty() {  
         info!("[CONNECT] AP RSN IE: {:02x?}", &ap.rsn_ie);  
         let sta_rsn = build_wpa2_rsn_ie_from_ap(&ap.rsn_ie);  
         info!("[CONNECT] STA RSN IE: {:02x?}", &sta_rsn);  
         sta_rsn  
-    }; 
+    } else if ap.capability & 0x0010 != 0 {  
+        // Privacy 位已设置但未捕获到 RSN IE —— 构建默认 WPA2-PSK RSN IE  
+        info!("[CONNECT] Privacy bit set but no RSN IE, using default WPA2-PSK RSN IE");  
+        build_wpa2_rsn_ie() 
+    } else {  
+        info!("[CONNECT] Open network (no RSN IE, no Privacy bit)");  
+        Vec::new()  
+    };
 
     let connect_result = connect(  
         bus, vif_idx, target_ssid, &ap.bssid,  
-        ap.center_freq, &rsn_ie, 30000, 
+        ap.center_freq, &rsn_ie, 15000, 
     )?;  
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   

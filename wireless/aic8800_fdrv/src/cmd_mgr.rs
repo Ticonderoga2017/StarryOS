@@ -10,7 +10,7 @@ use axtask::future::block_on;
 use log;
 
 use crate::{bus::{BusState, WifiBus}, lmac_msg::*};
-use sdhci_cv1800::regs::*; 
+use sdhci_cv1800::{mask_unmask_card_irq_raw, regs::*}; 
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -459,19 +459,18 @@ pub fn send_me_chan_config_req(
     timeout_ms: u64
 ) -> Result<Vec<u8>, CmdError> {
     // mac_chan_def 大小: freq(2) + band(1) + flags(1) + tx_power(1) = 5 bytes
-    // 假设无 padding = 5 bytes per entry
-    const CHAN_DEF_SIZE: usize = 5; // mac_chan_def 大小
+    // 假设无 padding = 6 bytes per entry
     const MAX_2G4: usize = 14;
     const MAX_5G: usize = 28;
 
     // 总大小 = 14*5 + 28*5 + 1 + 1 = 70 + 140 + 2 = 212
-    let total_size = MAX_2G4 * CHAN_DEF_SIZE + MAX_5G * CHAN_DEF_SIZE + 2;
+    let total_size = MAX_2G4 * MAC_CHAN_DEF_SIZE + MAX_5G * MAC_CHAN_DEF_SIZE + 2;
     let mut param = alloc::vec![0u8; total_size];
 
     // 填充 chan2G4[0..14]
     let chan_cnt = CHAN_2G4_FREQS.len().min(MAX_2G4);
     for i in 0..chan_cnt {
-        let off = i * CHAN_DEF_SIZE;
+        let off = i * MAC_CHAN_DEF_SIZE;
         param[off..off + 2].copy_from_slice(&CHAN_2G4_FREQS[i].to_le_bytes()); // freq
         param[off + 2] = 0; // band = NL80211_BAND_2GHZ
         param[off + 3] = 0; // flags = 0 (enabled)
@@ -481,7 +480,7 @@ pub fn send_me_chan_config_req(
     // chan5G[0..28] 全零（不使用 5GHz）
 
     // chan2G4_cnt 和 chan5G_cnt 在尾部
-    let cnt_offset = MAX_2G4 * CHAN_DEF_SIZE + MAX_5G * CHAN_DEF_SIZE;
+    let cnt_offset = MAX_2G4 * MAC_CHAN_DEF_SIZE + MAX_5G * MAC_CHAN_DEF_SIZE;
     param[cnt_offset] = chan_cnt as u8;     // chan2G4_cnt
     param[cnt_offset + 1] = 0;             // chan5G_cnt
 
@@ -1374,14 +1373,14 @@ pub fn send_eapol_data_frame(
 ) -> Result<(), CmdError> {  
     const SDIO_HEADER_LEN: usize = 4;  
     const HOSTDESC_SIZE: usize = 28;  
-    const ETH_HEADER_LEN: usize = 14;  
     const TX_ALIGNMENT: usize = 4; 
 
-    // Ethernet frame = dst(6) + src(6) + ethertype(2) + eapol payload  
-    let eth_frame_len = ETH_HEADER_LEN + eapol.len();  
-  
-    // SDIO payload = hostdesc + ethernet frame  
-    let sdio_payload_len = HOSTDESC_SIZE + eth_frame_len;  
+    // payload = EAPOL 数据（不含 Ethernet 头）  
+    // Ethernet 头信息已在 hostdesc 的 eth_dest/eth_src/ethertype 字段中  
+    let payload_len = eapol.len();  
+
+    // SDIO payload = hostdesc + payload（不含 Ethernet 头）  
+    let sdio_payload_len = HOSTDESC_SIZE + payload_len; 
   
     // sdio_header[0..1] = payload length (不含 sdio_header 本身)  
     let raw_len = SDIO_HEADER_LEN + sdio_payload_len;  
@@ -1400,9 +1399,8 @@ pub fn send_eapol_data_frame(
     let mut buf = vec![0u8; final_len];  
   
     // ---- SDIO header [0..4] ----  
-    let sdio_len = sdio_payload_len;  
-    buf[0] = (sdio_len & 0xFF) as u8;  
-    buf[1] = ((sdio_len >> 8) & 0x0F) as u8;  
+    buf[0] = (sdio_payload_len & 0xFF) as u8;  
+    buf[1] = ((sdio_payload_len >> 8) & 0x0F) as u8;  
     buf[2] = 0x01; // SDIO_TYPE_DATA = 0x00, 但 Linux 用 0x01 for data  
     buf[3] = 0x00;  
   
@@ -1410,14 +1408,17 @@ pub fn send_eapol_data_frame(
     let hd = &mut buf[SDIO_HEADER_LEN..SDIO_HEADER_LEN + HOSTDESC_SIZE];  
   
     // packet_len = ethernet frame length  
-    hd[0..2].copy_from_slice(&(eth_frame_len as u16).to_le_bytes());  
+    hd[0..2].copy_from_slice(&(payload_len as u16).to_le_bytes());  
+    // flags_ext = 0  
+    // hostid: 设置 bit 31 表示需要 TX 确认
+    hd[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes());  
     // flags_ext = 0  
     // hostid = 0  
     // eth_dest_addr [8..14]  
     hd[8..14].copy_from_slice(dst_mac);  
     // eth_src_addr [14..20]  
     hd[14..20].copy_from_slice(src_mac);  
-    // ethertype [20..22] = 0x888E (big-endian in Ethernet, but hostdesc uses LE)  
+    // ethertype [20..22] = 0x888E (网络字节序，与 Linux 一致：直接拷贝 h_proto)  
     hd[20..22].copy_from_slice(&0x888Eu16.to_be_bytes());  
     // ac = 0 (BE)  
     hd[22] = 0;  
@@ -1427,28 +1428,19 @@ pub fn send_eapol_data_frame(
     hd[24] = 0;  
     // staid = 0 (AP's sta_idx from SM_CONNECT_IND)  
     hd[25] = 0;  
-    // flags = 0  
     hd[26..28].copy_from_slice(&0u16.to_le_bytes());  
   
     // ---- Ethernet frame [32..] ----  
     let eth_start = SDIO_HEADER_LEN + HOSTDESC_SIZE;  
-    buf[eth_start..eth_start + 6].copy_from_slice(dst_mac);  
-    buf[eth_start + 6..eth_start + 12].copy_from_slice(src_mac);  
-    buf[eth_start + 12..eth_start + 14].copy_from_slice(&0x888Eu16.to_be_bytes());  
-    buf[eth_start + 14..eth_start + 14 + eapol.len()].copy_from_slice(eapol);  
-  
-    log::info!(  
-        "[cmd_mgr] sending EAPOL DATA frame: eapol_len={}, total_len={}",  
-        eapol.len(), final_len  
-    );  
+    buf[eth_start..eth_start + eapol.len()].copy_from_slice(eapol);
   
     // 通过 TX 队列发送（复用现有的 tx_thread 路径）  
     // 但 DATA 帧不走 cmd_pending，需要直接写入 SDIO  
     // 最简单的方式：直接获取 SDIO 锁并写入  
     {  
-        let base = bus.sdio_mmio_base.load(core::sync::atomic::Ordering::Acquire);  
+        let base = bus.sdio_mmio_base.load(Ordering::Acquire);  
         if base != 0 {  
-            sdhci_cv1800::mask_unmask_card_irq_raw(base, true);  
+            mask_unmask_card_irq_raw(base, true);  
         }  
   
         // 流控  
@@ -1468,7 +1460,7 @@ pub fn send_eapol_data_frame(
   
         if !fc_ok {  
             if base != 0 {  
-                sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+                mask_unmask_card_irq_raw(base, false);  
             }  
             log::error!("[cmd_mgr] EAPOL TX flow_ctrl timeout");  
             return Err(CmdError::Timeout);  
@@ -1479,7 +1471,7 @@ pub fn send_eapol_data_frame(
             log::error!("[cmd_mgr] EAPOL TX write_fifo failed: {:?}", e);  
             drop(sdio);  
             if base != 0 {  
-                sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+                mask_unmask_card_irq_raw(base, false);  
             }  
             return Err(CmdError::SdioError);  
         }  
@@ -1487,7 +1479,7 @@ pub fn send_eapol_data_frame(
   
         bus.rx_irq_pollset.wake();  
         if base != 0 {  
-            sdhci_cv1800::mask_unmask_card_irq_raw(base, false);  
+            mask_unmask_card_irq_raw(base, false);  
         }  
     }  
   

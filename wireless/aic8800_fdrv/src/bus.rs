@@ -254,7 +254,7 @@ pub fn sdio1_irq_handler() {
         // 屏蔽 CARD_INT 信号，防止重复触发（电平触发）
         mask_unmask_card_irq_raw(base, true);
         // 唤醒 wifi-rx 线程
-        // bus.rx_irq_pollset.wake();
         bus.rx_irq_pending.store(true, Ordering::Release);
+        bus.rx_irq_pollset.wake();
     }
 }
