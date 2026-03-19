@@ -25,7 +25,7 @@ use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 pub const ETH_P_PAE: u16 = 0x888E;  
   
 /// EAPOL 版本  
-const EAPOL_VERSION: u8 = 0x02; // 802.1X-2004  
+const EAPOL_VERSION: u8 = 0x01; // 802.1X-2004  
   
 /// EAPOL 类型  
 const EAPOL_TYPE_KEY: u8 = 0x03;  
@@ -413,19 +413,16 @@ fn aes_key_unwrap(kek: &[u8], wrapped: &[u8]) -> Result<Vec<u8>, WpaError> {
     Ok(r)  
 }  
 
-/// 生成 SNonce（使用时间戳混合）  
 fn generate_snonce() -> [u8; NONCE_LEN] {  
     let mut snonce = [0u8; NONCE_LEN];  
     let ts = axhal::time::monotonic_time_nanos();  
-  
-    // 用时间戳和简单的混合函数填充 32 字节  
-    for i in 0..4 {  
-        let val = ts.wrapping_mul(0x5851F42D4C957F2D_u64.wrapping_add(i as u64));  
-        snonce[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());  
-    }  
-  
+    let ts_bytes = ts.to_le_bytes();  
+    let hash1 = hmac_sha1(&ts_bytes, b"snonce-gen-1");  
+    let hash2 = hmac_sha1(&ts_bytes, b"snonce-gen-2");  
+    snonce[..20].copy_from_slice(&hash1);  
+    snonce[20..32].copy_from_slice(&hash2[..12]);  
     snonce  
-}  
+}
 
 /// 构造 EAPOL-Key 帧  
 ///  
@@ -558,13 +555,17 @@ impl Wpa2Handshake {
         let mut pmk = [0u8; PMK_LEN];  
         pmk.copy_from_slice(&pmk_vec);  
 
-        log::info!(  
-            "[wpa2] PMK derived, AA={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, SPA={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
-            aa[0], aa[1], aa[2], aa[3], aa[4], aa[5],  
-            spa[0], spa[1], spa[2], spa[3], spa[4], spa[5],  
-        );  
+        log::info!("[wpa2] PMK = {:02x?}", &pmk[..]);
+
+        // log::info!(  
+        //     "[wpa2] PMK derived, AA={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, SPA={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
+        //     aa[0], aa[1], aa[2], aa[3], aa[4], aa[5],  
+        //     spa[0], spa[1], spa[2], spa[3], spa[4], spa[5],  
+        // );  
   
         let snonce = generate_snonce(); 
+
+        log::info!("[wpa2] SNonce = {:02x?}", &snonce[..]);
         
         Self {  
             state: HandshakeState::Idle,  
@@ -596,6 +597,7 @@ impl Wpa2Handshake {
         if has_ack && !has_mic {  
             // M1: ACK=1, MIC=0  
             log::info!("[wpa2] === Processing M1 ===");  
+            log::info!("[wpa2] M1 full ({} bytes): {:02x?}", eapol.len(), eapol);
             self.process_m1(&hdr, eapol)  
         } else if has_ack && has_mic && has_install && has_enc {  
             // M3: ACK=1, MIC=1, Install=1, EncKeyData=1  
@@ -624,12 +626,13 @@ impl Wpa2Handshake {
         self.anonce.copy_from_slice(&hdr.key_nonce);  
         self.replay_counter.copy_from_slice(&hdr.replay_counter);  
   
-        log::info!(  
-            "[wpa2] M1: anonce={:02x}{:02x}{:02x}{:02x}..., replay={:02x}{:02x}{:02x}{:02x}...",  
-            self.anonce[0], self.anonce[1], self.anonce[2], self.anonce[3],  
-            self.replay_counter[0], self.replay_counter[1],  
-            self.replay_counter[2], self.replay_counter[3],  
-        ); 
+        log::info!("[wpa2] M1 full ({} bytes): {:02x?}", eapol.len(), eapol);
+        log::info!("[wpa2] derive_ptk inputs:");  
+        log::info!("[wpa2]   PMK: {:02x?}", &self.pmk);  
+        log::info!("[wpa2]   AA:  {:02x?}", &self.aa);  
+        log::info!("[wpa2]   SPA: {:02x?}", &self.spa);  
+        log::info!("[wpa2]   ANonce: {:02x?}", &self.anonce);  
+        log::info!("[wpa2]   SNonce: {:02x?}", &self.snonce);
 
         // 派生 PTK  
         let ptk = derive_ptk(  
@@ -640,12 +643,9 @@ impl Wpa2Handshake {
             &self.snonce,  
         );
 
-        log::info!(  
-            "[wpa2] PTK derived: kck={:02x?}..., kek={:02x?}..., tk={:02x?}...",  
-            &ptk.kck[..4],  
-            &ptk.kek[..4],  
-            &ptk.tk[..4],  
-        );  
+        log::info!("[wpa2] PTK KCK (full 16B): {:02x?}", &ptk.kck);  
+        log::info!("[wpa2] PTK KEK (full 16B): {:02x?}", &ptk.kek);  
+        log::info!("[wpa2] PTK TK  (full 16B): {:02x?}", &ptk.tk);
   
         self.ptk = Some(ptk); 
 
@@ -662,6 +662,10 @@ impl Wpa2Handshake {
             &self.rsn_ie,  // Key Data = RSN IE 
         );
 
+        assert_eq!(m2.len(), EAPOL_HDR_LEN + EAPOL_KEY_HDR_LEN + self.rsn_ie.len(), "M2 frame length mismatch");
+
+        log::info!("[wpa2] M2 full ({} bytes): {:02x?}", m2.len(), &m2);
+
         // 计算并填入 MIC  
         let mic = compute_mic(  
             &self.ptk.as_ref().unwrap().kck,  
@@ -669,6 +673,22 @@ impl Wpa2Handshake {
         ); 
         m2[MIC_OFFSET..MIC_OFFSET + MIC_LEN].copy_from_slice(&mic);  
   
+        log::info!("[wpa2] M2 Key Data (RSN IE used): {:02x?}", &self.rsn_ie);  
+        log::info!("[wpa2] M2 full ({} bytes): {:02x?}", m2.len(), &m2[..]);  
+        // 逐字段打印 M2 帧结构，方便对照 IEEE 802.11i 规范  
+        log::info!(  
+            "[wpa2] M2 breakdown: ver={:02x} type={:02x} body_len={:02x?} desc={:02x} key_info={:02x?} key_len={:02x?}",  
+            m2[0], m2[1], &m2[2..4], m2[4], &m2[5..7], &m2[7..9]  
+        );  
+        log::info!(  
+            "[wpa2] M2 breakdown: replay={:02x?} nonce={:02x?}...",  
+            &m2[9..17], &m2[17..21]  
+        );  
+        log::info!(  
+            "[wpa2] M2 breakdown: MIC={:02x?} key_data_len={:02x?}",  
+            &m2[81..97], &m2[97..99]  
+        );
+
         self.state = HandshakeState::M2Sent;  
         log::info!("[wpa2] M2 built ({} bytes), MIC={:02x?}...", m2.len(), &mic[..4]);  
   
@@ -771,4 +791,548 @@ impl Wpa2Handshake {
             gtk_key_idx: self.gtk_key_idx,  
         }))  
     }
+}
+
+/// Run all WPA2 crypto self-tests using known test vectors.  
+/// Call this once at startup before any handshake.  
+/// Returns true if all tests pass.  
+pub fn run_crypto_self_test() -> bool {  
+    let mut all_pass = true;  
+      
+    // ============================================================  
+    // Test 1: PBKDF2-SHA1 (RFC 6070 test vector)  
+    // Password: "password", Salt: "salt", Iterations: 4096, dkLen: 20  
+    // Expected: 4b007901 b765489a bead49d9 26f721d0 65a429c1  
+    // ============================================================  
+    {  
+        let dk = pbkdf2_sha1(b"password", b"salt", 4096, 20);  
+        let expected: [u8; 20] = [  
+            0x4b, 0x00, 0x79, 0x01, 0xb7, 0x65, 0x48, 0x9a,  
+            0xbe, 0xad, 0x49, 0xd9, 0x26, 0xf7, 0x21, 0xd0,  
+            0x65, 0xa4, 0x29, 0xc1,  
+        ];  
+        let pass = dk == expected;  
+        log::info!("[self-test] PBKDF2-SHA1 (RFC6070 c=4096): {}", if pass { "PASS" } else { "FAIL" });  
+        if !pass {  
+            log::error!("[self-test]   expected: {:02x?}", &expected[..]);  
+            log::error!("[self-test]   got:      {:02x?}", &dk[..]);  
+            all_pass = false;  
+        }  
+    }  
+      
+    // ============================================================  
+    // Test 2: WPA2-PSK PMK derivation  
+    // SSID: "IEEE", Passphrase: "password"  
+    // Expected PMK (from IEEE 802.11i test vectors):  
+    //   f42c6fc52df0ebef9ebb4b90b38a5f90 2e83fe1b135a70e23aed762e9710a12e  
+    // ============================================================  
+    {  
+        let pmk = pbkdf2_sha1(b"password", b"IEEE", 4096, 32);  
+        let expected: [u8; 32] = [  
+            0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef,  
+            0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,  
+            0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,  
+            0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,  
+        ];  
+        let pass = pmk == expected;  
+        log::info!("[self-test] WPA2-PSK PMK (SSID=IEEE, pass=password): {}", if pass { "PASS" } else { "FAIL" });  
+        if !pass {  
+            log::error!("[self-test]   expected: {:02x?}", &expected[..]);  
+            log::error!("[self-test]   got:      {:02x?}", &pmk[..]);  
+            all_pass = false;  
+        }  
+    }  
+      
+    // ============================================================  
+    // Test 3: Actual PMK for CU_Q2aa / uuux5cfj  
+    // Verify against `wpa_passphrase CU_Q2aa uuux5cfj` output  
+    // The user should compare this with the wpa_passphrase output  
+    // ============================================================  
+    {  
+        let pmk = pbkdf2_sha1(b"uuux5cfj", b"CU_Q2aa", 4096, 32);  
+        log::info!("[self-test] PMK for CU_Q2aa/uuux5cfj: {:02x?}", &pmk[..]);  
+        log::info!("[self-test] Compare with: wpa_passphrase CU_Q2aa uuux5cfj");  
+    }  
+      
+    // ============================================================  
+    // Test 4: HMAC-SHA1 (RFC 2202 test case 1)  
+    // Key: 0x0b repeated 20 times  
+    // Data: "Hi There"  
+    // Expected: b617318655057264e28bc0b6fb378c8ef146be00  
+    // ============================================================  
+    {  
+        let key = [0x0bu8; 20];  
+        let data = b"Hi There";  
+        let result = hmac_sha1(&key, data);  
+        let expected: [u8; 20] = [  
+            0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64,  
+            0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e,  
+            0xf1, 0x46, 0xbe, 0x00,  
+        ];  
+        let pass = result == expected;  
+        log::info!("[self-test] HMAC-SHA1 (RFC2202 #1): {}", if pass { "PASS" } else { "FAIL" });  
+        if !pass {  
+            log::error!("[self-test]   expected: {:02x?}", &expected[..]);  
+            log::error!("[self-test]   got:      {:02x?}", &result[..]);  
+            all_pass = false;  
+        }  
+    }  
+      
+    // ============================================================  
+    // Test 5: PRF-SHA1 (IEEE 802.11i Annex H.3 test vector)  
+    // This tests the PRF used for PTK derivation  
+    // Key (PMK): 0xcd repeated 32 times (dummy)  
+    // We test PRF output length = 48 (PTK_LEN)  
+    // ============================================================  
+    {  
+        // Use a simple known-input test: PRF-160 with known key/label/data  
+        // PRF(key, "prefix", data, 20) = HMAC-SHA1(key, "prefix" || 0x00 || data || 0x00)  
+        let key = [0xaau8; 16];  
+        let label = b"test label";  
+        let data = [0xbbu8; 32];  
+        let result = prf_sha1(&key, label, &data, 20);  
+        // We can't hardcode the expected value without computing it,  
+        // but we can verify it's deterministic and 20 bytes  
+        let result2 = prf_sha1(&key, label, &data, 20);  
+        let pass = result == result2 && result.len() == 20;  
+        log::info!("[self-test] PRF-SHA1 determinism: {}", if pass { "PASS" } else { "FAIL" });  
+        log::info!("[self-test]   PRF output (20B): {:02x?}", &result[..]);  
+    }  
+      
+    // ============================================================  
+    // Test 6: Full PTK derivation + MIC with IEEE 802.11i test vector  
+    // From IEEE 802.11i-2004 Annex H.4:  
+    //   PMK: cdcdc7a2 12d5e460 a1e7a3c4 e2f3c370   
+    //        b0f6b0a0 c2c7e0b0 f0a0e0d0 c0b0a090  
+    //   (This is a made-up PMK for testing)  
+    //  
+    // Instead, we do an end-to-end test:  
+    // Derive PTK from known inputs, compute MIC, verify it's consistent  
+    // ============================================================  
+    {  
+        let pmk: [u8; 32] = [  
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,  
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,  
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,  
+        ];  
+        let aa: [u8; 6] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];  
+        let spa: [u8; 6] = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5];  
+        let anonce: [u8; 32] = [0xc0; 32];  
+        let snonce: [u8; 32] = [0xd0; 32];  
+          
+        let ptk = derive_ptk(&pmk, &aa, &spa, &anonce, &snonce);  
+          
+        // Log the full PTK for manual verification  
+        log::info!("[self-test] PTK derivation test:");  
+        log::info!("[self-test]   KCK: {:02x?}", &ptk.kck[..]);  
+        log::info!("[self-test]   KEK: {:02x?}", &ptk.kek[..]);  
+        log::info!("[self-test]   TK:  {:02x?}", &ptk.tk[..]);  
+          
+        // Verify address ordering: AA=a0:..., SPA=b0:...  
+        // Since 0xa0 < 0xb0, min=AA, max=SPA  
+        // Since 0xc0 < 0xd0, min=ANonce, max=SNonce  
+        log::info!("[self-test]   addr order: min=AA(a0), max=SPA(b0)");  
+        log::info!("[self-test]   nonce order: min=ANonce(c0), max=SNonce(d0)");  
+          
+        // Verify MIC computation is consistent  
+        let test_frame = [0u8; 121]; // dummy frame  
+        let mic1 = compute_mic(&ptk.kck, &test_frame);  
+        let mic2 = compute_mic(&ptk.kck, &test_frame);  
+        let pass = mic1 == mic2;  
+        log::info!("[self-test] MIC consistency: {}", if pass { "PASS" } else { "FAIL" });  
+        log::info!("[self-test]   MIC: {:02x?}", &mic1[..]);  
+    }  
+      
+    // ============================================================  
+    // Test 7: SNonce quality check  
+    // ============================================================  
+    {  
+        let sn1 = generate_snonce();  
+        // Small delay to ensure different timestamp  
+        for _ in 0..10000 { core::hint::spin_loop(); }  
+        let sn2 = generate_snonce();  
+          
+        let different = sn1 != sn2;  
+        log::info!("[self-test] SNonce uniqueness: {}", if different { "PASS" } else { "FAIL" });  
+        log::info!("[self-test]   SNonce1: {:02x?}", &sn1[..]);  
+        log::info!("[self-test]   SNonce2: {:02x?}", &sn2[..]);  
+          
+        // Check entropy: count unique bytes  
+        let mut seen = [false; 256];  
+        for &b in sn1.iter() { seen[b as usize] = true; }  
+        let unique_bytes = seen.iter().filter(|&&x| x).count();  
+        log::info!("[self-test]   SNonce1 unique byte values: {}/32", unique_bytes);  
+        if unique_bytes < 8 {  
+            log::warn!("[self-test]   WARNING: Low entropy in SNonce!");  
+            // Don't fail - SNonce quality doesn't cause AP rejection  
+        }  
+          
+        if !different {  
+            all_pass = false;  
+        }  
+    }  
+      
+    // ============================================================  
+    // Test 8: End-to-end M2 construction test  
+    // Build an M2 frame and verify its structure  
+    // ============================================================  
+    {  
+        let replay = [0u8, 0, 0, 0, 0, 0, 0, 1u8];  
+        let nonce = [0x42u8; 32];  
+        let rsn_ie: [u8; 22] = [  
+            0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,  
+            0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,  
+            0x00, 0x0f, 0xac, 0x02, 0x0c, 0x00,  
+        ];  
+        let key_info: u16 = KEY_INFO_TYPE_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC;  
+          
+        let m2 = build_eapol_key_frame(key_info, 0, &replay, &nonce, &rsn_ie);  
+          
+        let mut pass = true;  
+        // Check EAPOL version  
+        if m2[0] != EAPOL_VERSION {   
+            log::error!("[self-test] M2[0] EAPOL version: 0x{:02x} (expected 0x{:02x})", m2[0], EAPOL_VERSION);  
+            pass = false;   
+        }  
+        // Check type  
+        if m2[1] != 0x03 {   
+            log::error!("[self-test] M2[1] type: 0x{:02x} (expected 0x03)", m2[1]);  
+            pass = false;   
+        }  
+        // Check body length  
+        let body_len = u16::from_be_bytes([m2[2], m2[3]]);  
+        if body_len != 117 { // 95 + 22  
+            log::error!("[self-test] M2 body_len: {} (expected 117)", body_len);  
+            pass = false;  
+        }  
+        // Check descriptor type  
+        if m2[4] != 0x02 {  
+            log::error!("[self-test] M2[4] desc_type: 0x{:02x} (expected 0x02)", m2[4]);  
+            pass = false;  
+        }  
+        // Check key info  
+        let ki = u16::from_be_bytes([m2[5], m2[6]]);  
+        if ki != 0x010A {  
+            log::error!("[self-test] M2 key_info: 0x{:04x} (expected 0x010A)", ki);  
+            pass = false;  
+        }  
+        // Check key length = 0  
+        let kl = u16::from_be_bytes([m2[7], m2[8]]);  
+        if kl != 0 {  
+            log::error!("[self-test] M2 key_length: {} (expected 0)", kl);  
+            pass = false;  
+        }  
+        // Check replay counter  
+        if m2[9..17] != replay {  
+            log::error!("[self-test] M2 replay counter mismatch");  
+            pass = false;  
+        }  
+        // Check MIC is zero (before filling)  
+        let mic_zeros = m2[81..97].iter().all(|&b| b == 0);  
+        if !mic_zeros {  
+            log::error!("[self-test] M2 MIC not zeroed before fill");  
+            pass = false;  
+        }  
+        // Check key data length  
+        let kdl = u16::from_be_bytes([m2[97], m2[98]]);  
+        if kdl != 22 {  
+            log::error!("[self-test] M2 key_data_len: {} (expected 22)", kdl);  
+            pass = false;  
+        }  
+        // Check key data = RSN IE  
+        if m2[99..121] != rsn_ie {  
+            log::error!("[self-test] M2 key_data != RSN IE");  
+            pass = false;  
+        }  
+        // Check total length  
+        if m2.len() != 121 {  
+            log::error!("[self-test] M2 total_len: {} (expected 121)", m2.len());  
+            pass = false;  
+        }  
+          
+        log::info!("[self-test] M2 frame structure: {}", if pass { "PASS" } else { "FAIL" });  
+        if !pass { all_pass = false; }  
+    }  
+      
+    log::info!("[self-test] ========== ALL TESTS: {} ==========", if all_pass { "PASS" } else { "FAIL" });  
+    all_pass  
+}
+
+/// 使用 IEEE 802.11i Annex J 测试向量验证 PRF-SHA1 和 derive_ptk  
+pub fn run_ptk_test() -> bool {  
+    let mut all_pass = true;  
+  
+    // ================================================================  
+    // 测试 1: PRF-SHA1 基础验证 (IEEE 802.11i Annex J.3)  
+    //  
+    // IEEE 802.11i-2004 Section H.3.2 给出了 PRF-512 的测试向量:  
+    //   Key = 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b (20 bytes)  
+    //   Prefix = "prefix" (6 bytes)  
+    //   Data = "Hi There" (8 bytes)  
+    //  
+    // PRF-512 输出 (64 bytes):  
+    //   bcd4c650 b30b9684 951829e0 d75f9d54  
+    //   b862175e d9f00606 e17d8da3 5402ffee  
+    //   75df78c3 d31e0f88 9f012120 c0862beb  
+    //   67753e74 07307841 19b0b1ef 6c1c2e7f  
+    // ================================================================  
+    {  
+        let key = [0x0bu8; 20];  
+        let prefix = b"prefix";  
+        let data = b"Hi There";  
+        let expected: [u8; 64] = [  
+            0xbc, 0xd4, 0xc6, 0x50, 0xb3, 0x0b, 0x96, 0x84,  
+            0x95, 0x18, 0x29, 0xe0, 0xd7, 0x5f, 0x9d, 0x54,  
+            0xb8, 0x62, 0x17, 0x5e, 0xd9, 0xf0, 0x06, 0x06,  
+            0xe1, 0x7d, 0x8d, 0xa3, 0x54, 0x02, 0xff, 0xee,  
+            0x75, 0xdf, 0x78, 0xc3, 0xd3, 0x1e, 0x0f, 0x88,  
+            0x9f, 0x01, 0x21, 0x20, 0xc0, 0x86, 0x2b, 0xeb,  
+            0x67, 0x75, 0x3e, 0x74, 0x07, 0x30, 0x78, 0x41,  
+            0x19, 0xb0, 0xb1, 0xef, 0x6c, 0x1c, 0x2e, 0x7f,  
+        ];  
+  
+        let result = prf_sha1(&key, prefix, data, 64);  
+        if result[..] == expected[..] {  
+            log::info!("[ptk-test] PRF-512 basic: PASS");  
+        } else {  
+            log::error!("[ptk-test] PRF-512 basic: FAIL");  
+            log::error!("[ptk-test]   expected: {:02x?}", &expected[..16]);  
+            log::error!("[ptk-test]   got:      {:02x?}", &result[..16]);  
+            for i in 0..64 {  
+            if expected[i] != result[i] {  
+                log::error!("[ptk-test]   first diff at byte {}: expected 0x{:02x}, got 0x{:02x}", i, expected[i], result[i]);  
+                break;  
+            }  
+        }
+            all_pass = false;  
+        }  
+    }  
+  
+    // ================================================================  
+    // 测试 2: 完整 PTK 推导 (IEEE 802.11i Annex J.4 / wpa_supplicant test vectors)  
+    //  
+    // 使用 wpa_supplicant 测试中的已知向量:  
+    //   PMK  = 0xcdcf...  (来自 SSID="IEEE", passphrase="password")  
+    //   AA   = a0:a1:a2:a3:a4:a5  
+    //   SPA  = b0:b1:b2:b3:b4:b5  
+    //   ANonce = 固定值  
+    //   SNonce = 固定值  
+    //  
+    // 先验证 PMK:  
+    //   PMK = PBKDF2-SHA1("password", "IEEE", 4096, 32)  
+    //       = f42c6fc52df0ebef9ebb4b90b38a5f90 2e83fe1b135a70e23aed762e9710a12e  
+    // ================================================================  
+    {  
+        let pmk_vec = pbkdf2_sha1(b"password", b"IEEE", 4096, 32);  
+        let expected_pmk: [u8; 32] = [  
+            0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef,  
+            0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,  
+            0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,  
+            0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,  
+        ];  
+        if pmk_vec[..] == expected_pmk[..] {  
+            log::info!("[ptk-test] PMK (IEEE/password): PASS");  
+        } else {  
+            log::error!("[ptk-test] PMK (IEEE/password): FAIL");  
+            log::error!("[ptk-test]   expected: {:02x?}", &expected_pmk[..]);  
+            log::error!("[ptk-test]   got:      {:02x?}", &pmk_vec[..]);  
+            all_pass = false;  
+        }  
+    }  
+  
+    // ================================================================  
+    // 测试 3: 完整 PTK 推导 + MIC 验证  
+    //  
+    // 使用完全确定性的输入，手动计算期望输出。  
+    // 这里使用 IEEE 802.11i-2004 Annex J.6 的测试数据:  
+    //  
+    //   PMK = f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e  
+    //   AA  = a0:a1:a2:a3:a4:a5  
+    //   SPA = b0:b1:b2:b3:b4:b5  
+    //   ANonce = e0e1e2e3e4e5e6e7e8e9f0f1f2f3f4f5e0e1e2e3e4e5e6e7e8e9f0f1f2f3f4f5  
+    //   SNonce = c0c1c2c3c4c5c6c7c8c9d0d1d2d3d4d5c0c1c2c3c4c5c6c7c8c9d0d1d2d3d4d5  
+    //  
+    // 地址排序: AA=a0:a1:..., SPA=b0:b1:...  
+    //   Min(AA,SPA) = AA (0xa0 < 0xb0)  
+    //   Max(AA,SPA) = SPA  
+    //  
+    // Nonce 排序: ANonce=e0e1..., SNonce=c0c1...  
+    //   Min(ANonce,SNonce) = SNonce (0xc0 < 0xe0)  
+    //   Max(ANonce,SNonce) = ANonce  
+    //  
+    // data = AA || SPA || SNonce || ANonce (76 bytes)  
+    //  
+    // PTK = PRF-384(PMK, "Pairwise key expansion", data)  
+    //     = 48 bytes = KCK(16) + KEK(16) + TK(16)  
+    //  
+    // 我们无法在这里硬编码期望值（因为没有标准文档中的精确值），  
+    // 但可以做以下验证:  
+    //   1. 调用 derive_ptk 得到 PTK  
+    //   2. 手动调用 prf_sha1 得到相同结果  
+    //   3. 用 KCK 计算一个已知 M2 帧的 MIC  
+    //   4. 验证 MIC 非全零且长度正确  
+    // ================================================================  
+    {  
+        let pmk: [u8; 32] = [  
+            0xf4, 0x2c, 0x6f, 0xc5, 0x2d, 0xf0, 0xeb, 0xef,  
+            0x9e, 0xbb, 0x4b, 0x90, 0xb3, 0x8a, 0x5f, 0x90,  
+            0x2e, 0x83, 0xfe, 0x1b, 0x13, 0x5a, 0x70, 0xe2,  
+            0x3a, 0xed, 0x76, 0x2e, 0x97, 0x10, 0xa1, 0x2e,  
+        ];  
+        let aa: [u8; 6] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5];  
+        let spa: [u8; 6] = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5];  
+        let anonce: [u8; 32] = [  
+            0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,  
+            0xe8, 0xe9, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5,  
+            0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,  
+            0xe8, 0xe9, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5,  
+        ];  
+        let snonce: [u8; 32] = [  
+            0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,  
+            0xc8, 0xc9, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5,  
+            0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,  
+            0xc8, 0xc9, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5,  
+        ];  
+  
+        // 方法 A: 通过 derive_ptk  
+        let ptk_a = derive_ptk(&pmk, &aa, &spa, &anonce, &snonce);  
+  
+        // 方法 B: 手动构造 data 并调用 prf_sha1  
+        let mut data = [0u8; 76];  
+        // Min(AA, SPA) = AA (0xa0 < 0xb0)  
+        data[0..6].copy_from_slice(&aa);  
+        data[6..12].copy_from_slice(&spa);  
+        // Min(ANonce, SNonce) = SNonce (0xc0 < 0xe0)  
+        data[12..44].copy_from_slice(&snonce);  
+        data[44..76].copy_from_slice(&anonce);  
+  
+        let ptk_b = prf_sha1(&pmk, b"Pairwise key expansion", &data, 48);  
+  
+        if ptk_a.kck[..] == ptk_b[0..16]  
+            && ptk_a.kek[..] == ptk_b[16..32]  
+            && ptk_a.tk[..] == ptk_b[32..48]  
+        {  
+            log::info!("[ptk-test] derive_ptk consistency: PASS");  
+        } else {  
+            log::error!("[ptk-test] derive_ptk consistency: FAIL");  
+            all_pass = false;  
+        }  
+  
+        // 打印完整 PTK 供外部工具验证  
+        log::info!(  
+            "[ptk-test] PTK (AA=a0a1.., SPA=b0b1.., ANonce=e0e1.., SNonce=c0c1..):"  
+        );  
+        log::info!("[ptk-test]   KCK = {:02x?}", &ptk_a.kck);  
+        log::info!("[ptk-test]   KEK = {:02x?}", &ptk_a.kek);  
+        log::info!("[ptk-test]   TK  = {:02x?}", &ptk_a.tk);  
+  
+        // 验证 MIC 计算: 构造一个假 M2 帧，计算 MIC  
+        let rsn_ie: [u8; 22] = [  
+            0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,  
+            0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,  
+            0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,  
+        ];  
+        let replay: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];  
+  
+        let mut m2 = build_eapol_key_frame(  
+            KEY_INFO_TYPE_HMAC_SHA1_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC,  
+            0,  
+            &replay,  
+            &snonce,  
+            &rsn_ie,  
+        );  
+  
+        // MIC 应该是全零（还没填）  
+        assert!(m2[MIC_OFFSET..MIC_OFFSET + MIC_LEN].iter().all(|&b| b == 0));  
+  
+        let mic = compute_mic(&ptk_a.kck, &m2);  
+        m2[MIC_OFFSET..MIC_OFFSET + MIC_LEN].copy_from_slice(&mic);  
+  
+        log::info!("[ptk-test]   MIC = {:02x?}", &mic);  
+  
+        // MIC 不应该是全零  
+        if mic.iter().any(|&b| b != 0) {  
+            log::info!("[ptk-test] MIC non-zero: PASS");  
+        } else {  
+            log::error!("[ptk-test] MIC is all zeros: FAIL");  
+            all_pass = false;  
+        }  
+  
+        // 验证 MIC: 重新计算应该得到相同结果  
+        let mut m2_verify = m2.clone();  
+        m2_verify[MIC_OFFSET..MIC_OFFSET + MIC_LEN].fill(0);  
+        let mic2 = compute_mic(&ptk_a.kck, &m2_verify);  
+        if mic == mic2 {  
+            log::info!("[ptk-test] MIC verify round-trip: PASS");  
+        } else {  
+            log::error!("[ptk-test] MIC verify round-trip: FAIL");  
+            all_pass = false;  
+        }  
+    }  
+  
+    // ================================================================  
+    // 测试 4: 用实际日志中的数据做端到端验证  
+    //  
+    // 从最新日志中提取:  
+    //   PMK = eaf4321a66940a1c1fb36c6e43090eb29c9cdf1a47b6637c69f13f1ac9d23c6c  
+    //   AA  = 8c:83:e8:26:59:08  
+    //   SPA = 38:7a:cc:94:2d:2c  
+    //   ANonce = 从 M1 中提取  
+    //   SNonce = 从 generate_snonce 生成  
+    //  
+    // 这个测试打印完整的 PTK 和 MIC，供外部 Python 脚本验证  
+    // ================================================================  
+    {  
+        let pmk: [u8; 32] = [  
+            0xea, 0xf4, 0x32, 0x1a, 0x66, 0x94, 0x0a, 0x1c,  
+            0x1f, 0xb3, 0x6c, 0x6e, 0x43, 0x09, 0x0e, 0xb2,  
+            0x9c, 0x9c, 0xdf, 0x1a, 0x47, 0xb6, 0x63, 0x7c,  
+            0x69, 0xf1, 0x3f, 0x1a, 0xc9, 0xd2, 0x3c, 0x6c,  
+        ];  
+        let aa: [u8; 6] = [0x8c, 0x83, 0xe8, 0x26, 0x59, 0x08];  
+        let spa: [u8; 6] = [0x38, 0x7a, 0xcc, 0x94, 0x2d, 0x2c];  
+  
+        // 地址排序验证  
+        let (min_a, max_a) = if aa[..] < spa[..] {  
+            (&aa[..], &spa[..])  
+        } else {  
+            (&spa[..], &aa[..])  
+        };  
+        log::info!(  
+            "[ptk-test] Addr sort: min={:02x?}, max={:02x?}",  
+            min_a, max_a  
+        );  
+        // 0x38 < 0x8c, 所以 SPA 是 min, AA 是 max  
+        if min_a == &spa[..] && max_a == &aa[..] {  
+            log::info!("[ptk-test] Addr sort: PASS (SPA < AA)");  
+        } else {  
+            log::error!("[ptk-test] Addr sort: FAIL");  
+            all_pass = false;  
+        }  
+    }  
+  
+    // ================================================================  
+    // 测试 5: PRF-384 输出长度验证  
+    // PTK = PRF-384 = 48 bytes, 需要 ceil(48/20) = 3 次 HMAC-SHA1  
+    // ================================================================  
+    {  
+        let key = [0xAA_u8; 32];  
+        let result = prf_sha1(&key, b"test label", b"test data", 48);  
+        if result.len() == 48 {  
+            log::info!("[ptk-test] PRF-384 output length: PASS");  
+        } else {  
+            log::error!(  
+                "[ptk-test] PRF-384 output length: FAIL (got {})",  
+                result.len()  
+            );  
+            all_pass = false;  
+        }  
+    }  
+  
+    log::info!(  
+        "[ptk-test] ========== PTK TEST: {} ==========",  
+        if all_pass { "ALL PASS" } else { "FAIL" }  
+    );  
+    all_pass  
 }

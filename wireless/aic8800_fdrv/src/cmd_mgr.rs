@@ -1331,8 +1331,22 @@ pub fn wait_for_eapol(
 
         // 尝试从 eapol_queue 取出 
         {
-            let mut queue = bus.eapol_queue.lock();
-            if let Some(eapol) = queue.pop_front() {
+            let mut queue = bus.eapol_queue.lock();  
+            if !queue.is_empty() {  
+                // If multiple EAPOL frames queued (AP retransmissions),  
+                // use the latest one (last in queue)  
+                let count = queue.len();  
+                if count > 1 {  
+                    log::warn!(  
+                        "[cmd_mgr] {} EAPOL frames in queue, using latest (draining {} stale)",  
+                        count, count - 1  
+                    );  
+                }  
+                // Drain all but the last  
+                while queue.len() > 1 {  
+                    queue.pop_front();  
+                }  
+                let eapol = queue.pop_front().unwrap();  
                 log::info!(  
                     "[cmd_mgr] EAPOL frame received: {} bytes",  
                     eapol.len()  
@@ -1370,6 +1384,8 @@ pub fn send_eapol_data_frame(
     dst_mac: &[u8; 6],  
     src_mac: &[u8; 6],  
     eapol: &[u8],  
+    vif_idx: u8, 
+    sta_idx: u8,
 ) -> Result<(), CmdError> {  
     const SDIO_HEADER_LEN: usize = 4;  
     const HOSTDESC_SIZE: usize = 28;  
@@ -1388,6 +1404,10 @@ pub fn send_eapol_data_frame(
     // 对齐到 TX_ALIGNMENT  
     let aligned = (raw_len + TX_ALIGNMENT - 1) & !(TX_ALIGNMENT - 1);  
 
+    // SDIO header 长度字段 = 对齐后的总长度 - SDIO header 本身(4)  
+    // 即 hostdesc + payload + alignment_padding  
+    let sdio_hdr_len = aligned - SDIO_HEADER_LEN;  
+
     // 对齐到 SDIOWIFI_FUNC_BLOCKSIZE (512)  
     let final_len = if aligned % SDIOWIFI_FUNC_BLOCKSIZE != 0 {  
         let with_tail = aligned + 4; // TAIL_LEN  
@@ -1399,8 +1419,8 @@ pub fn send_eapol_data_frame(
     let mut buf = vec![0u8; final_len];  
   
     // ---- SDIO header [0..4] ----  
-    buf[0] = (sdio_payload_len & 0xFF) as u8;  
-    buf[1] = ((sdio_payload_len >> 8) & 0x0F) as u8;  
+    buf[0] = (sdio_hdr_len & 0xFF) as u8;  
+    buf[1] = ((sdio_hdr_len >> 8) & 0x0F) as u8;  
     buf[2] = 0x01; // SDIO_TYPE_DATA = 0x00, 但 Linux 用 0x01 for data  
     buf[3] = 0x00;  
   
@@ -1422,18 +1442,25 @@ pub fn send_eapol_data_frame(
     hd[20..22].copy_from_slice(&0x888Eu16.to_be_bytes());  
     // ac = 0 (BE)  
     hd[22] = 0;  
-    // tid = 0xFF (non-QoS)  
-    hd[23] = 0xFF;  
+    hd[23] = 0;  
     // vif_idx = 0  
-    hd[24] = 0;  
+    hd[24] = vif_idx;  
     // staid = 0 (AP's sta_idx from SM_CONNECT_IND)  
-    hd[25] = 0;  
+    hd[25] = sta_idx;  
     hd[26..28].copy_from_slice(&0u16.to_le_bytes());  
   
     // ---- Ethernet frame [32..] ----  
     let eth_start = SDIO_HEADER_LEN + HOSTDESC_SIZE;  
     buf[eth_start..eth_start + eapol.len()].copy_from_slice(eapol);
   
+    log::info!(  
+        "[cmd_mgr] EAPOL TX: sdio_hdr={:02x?}, hostdesc={:02x?}, payload_len={}, final_len={}",  
+        &buf[0..4],  
+        &buf[4..32],  
+        eapol.len(),  
+        final_len  
+    );
+
     // 通过 TX 队列发送（复用现有的 tx_thread 路径）  
     // 但 DATA 帧不走 cmd_pending，需要直接写入 SDIO  
     // 最简单的方式：直接获取 SDIO 锁并写入  

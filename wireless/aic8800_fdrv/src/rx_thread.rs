@@ -43,7 +43,7 @@ pub fn start(bus: Arc<WifiBus>) {
                 // 打印后重置 RX_WAKE_COUNT，使其反映"自上次处理以来的中断次数"  
                 let cnt = RX_WAKE_COUNT.swap(0, Ordering::Relaxed);  
                 if cnt > 0 {  
-                    log::info!("[wifi-rx] woke up (count={})", cnt);  
+                    log::trace!("[wifi-rx] woke up (count={})", cnt);  
                 } 
 
                 // 处理所有待读数据
@@ -109,7 +109,7 @@ fn process_rx_frames(bus: &WifiBus) {
             break;
         }
 
-        log::info!("[wifi-rx] block_cnt={}", block_cnt);  
+        log::trace!("[wifi-rx] block_cnt={}", block_cnt);  
         let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;  
         let mut buf = vec![0u8; data_len]; 
         {
@@ -161,7 +161,7 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
     //   ...  
     const FLAGS_OFFSET: usize = 48;  
   
-    // 802.11 MPDU 起始偏移 = RX_HWHRD_LEN = 60  
+    // sizeof(hw_rxhdr)(58) + 2(sdio align) + 2(extra padding) = 62, matches Linux driver's msdu_offset+2
     const MPDU_OFFSET: usize = 60;  
   
     const ETH_P_PAE: u16 = 0x888E;  
@@ -210,7 +210,7 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
             // 802.11 payload 从 offset+4 开始，长度 = pkt_len - 4（去掉 SDIO header）  
             // hw_rxhdr 从 offset+pkt_len 开始，长度 = RX_HWHRD_LEN  
             let data_payload = &buf[offset..offset + aggr_len];  
-            log::info!(  
+            log::trace!(  
                 "[wifi-rx] DATA frame, pkt_len={}, aggr_len={}",  
                 pkt_len, aggr_len  
             ); 
@@ -311,6 +311,12 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                 continue;  
             }
 
+            // 在 ethertype 检测之前添加  
+            log::info!(  
+                "[wifi-rx] LLC/SNAP check: [{:02x}, {:02x}, {:02x}] at llc_offset={}",  
+                mpdu[llc_offset], mpdu[llc_offset+1], mpdu[llc_offset+2], llc_offset  
+            );
+
             // 可选：验证 LLC/SNAP 头 (AA AA 03)  
             // if mpdu[llc_offset] != 0xAA || mpdu[llc_offset+1] != 0xAA || mpdu[llc_offset+2] != 0x03 {  
             //     // 非 LLC/SNAP 封装，跳过  
@@ -329,7 +335,21 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
             if ethertype == ETH_P_PAE {
                 // ===== EAPOL 帧 =====  
                 if pkt_len > payload_start {  
-                    let eapol = mpdu[payload_start..].to_vec();  
+                    let raw_eapol = &mpdu[payload_start..];
+                    // 根据 802.1X header 的 body_len 字段截断到实际长度  
+                    // 避免 MPDU 尾部的对齐填充字节被包含在 EAPOL 帧中  
+                    // 802.1X header: [version(1), type(1), body_len(2 BE)] 
+                    let eapol = if raw_eapol.len() >= 4 {
+                        let body_len = u16::from_be_bytes([raw_eapol[2], raw_eapol[3]]) as usize;  
+                        let actual_len = 4 + body_len; // 802.1X header + body  
+                        if actual_len <= raw_eapol.len() {  
+                            raw_eapol[..actual_len].to_vec()  
+                        } else {  
+                            raw_eapol.to_vec() // 帧比预期短，原样传递  
+                        } 
+                    } else {
+                        raw_eapol.to_vec() 
+                    };
                     log::info!(  
                         "[wifi-rx] EAPOL frame detected, eapol_len={}, decr={}",  
                         eapol.len(), decr_status  

@@ -389,6 +389,8 @@ pub struct ConnectResult {
     pub vif_idx: u8,  
     pub qos: bool,  
     pub aid: u16,  
+    /// 固件实际发送的 Association Request IEs（从 SM_CONNECT_IND 的 assoc_ie_buf 提取）  
+    pub assoc_req_ies: Vec<u8>,  
 }  
   
 /// 断连信息（从 SM_DISCONNECT_IND 解析）  

@@ -177,61 +177,100 @@ pub fn connect(
 }
 
 /// 解析 SM_CONNECT_IND 的 param 部分  
-fn parse_connect_ind(param: &[u8]) -> Result<ConnectResult, CmdError> {  
-    // sm_connect_ind 布局（参考 lmac_msg.h:2444-2477）:  
-    //   [0..2]    u16  status_code  
-    //   [2..8]    mac_addr bssid (6 bytes)  
-    //   [8]       bool roamed  
-    //   [9]       u8   vif_idx  
-    //   [10]      u8   ap_idx  
-    //   [11]      u8   ch_idx  
-    //   [12]      bool qos  
-    //   [13]      u8   acm  
-    //   [14..16]  u16  assoc_req_ie_len  
-    //   [16..18]  u16  assoc_rsp_ie_len  
-    //   [18..20]  2B padding (u32[] alignment)  
-    //   [20..820] u32  assoc_ie_buf[200] (800 bytes)  
-    //   [820..822] u16 aid  
-    //   ...      
+fn parse_connect_ind(param: &[u8]) -> Result<ConnectResult, CmdError> {    
+    // sm_connect_ind 布局（参考 lmac_msg.h:2444-2477）:    
+    //   [0..2]    u16  status_code    
+    //   [2..8]    mac_addr bssid (6 bytes)    
+    //   [8]       bool roamed    
+    //   [9]       u8   vif_idx    
+    //   [10]      u8   ap_idx    
+    //   [11]      u8   ch_idx    
+    //   [12]      bool qos    
+    //   [13]      u8   acm    
+    //   [14..16]  u16  assoc_req_ie_len    
+    //   [16..18]  u16  assoc_rsp_ie_len    
+    //   [18..20]  2B padding (u32[] alignment)    
+    //   [20..820] u32  assoc_ie_buf[200] (800 bytes)    
+    //   [820..822] u16 aid    
+    
+    if param.len() < 20 {    
+        log::error!("[wifi_mgr] SM_CONNECT_IND too short: {} bytes", param.len());    
+        return Err(CmdError::InvalidResponse);    
+    }    
+    
+    let status_code = u16::from_le_bytes([param[0], param[1]]);    
+    
+    let mut bssid = [0u8; 6];    
+    bssid.copy_from_slice(&param[2..8]);    
+    
+    let vif_idx = param[9];    
+    let ap_idx = param[10];    
+    let ch_idx = param[11];    
+    let qos = param[12] != 0;    
+    
+    let assoc_req_ie_len = u16::from_le_bytes([param[14], param[15]]) as usize;  
+    let assoc_rsp_ie_len = u16::from_le_bytes([param[16], param[17]]) as usize;  
   
-    if param.len() < 12 {  
-        log::error!("[wifi_mgr] SM_CONNECT_IND too short: {} bytes", param.len());  
-        return Err(CmdError::InvalidResponse);  
-    }  
+    // aid 在 2B padding + 800B assoc_ie_buf 之后，偏移 820  
+    let aid = if param.len() >= 822 {    
+        u16::from_le_bytes([param[820], param[821]])    
+    } else {    
+        log::warn!("[wifi_mgr] SM_CONNECT_IND too short for aid field ({} bytes), defaulting to 0", param.len());    
+        0    
+    };    
   
-    let status_code = u16::from_le_bytes([param[0], param[1]]);  
+    log::info!(    
+        "[wifi_mgr] SM_CONNECT_IND param_len={}, status={}, bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",    
+        param.len(), status_code,    
+        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]    
+    );  
   
-    let mut bssid = [0u8; 6];  
-    bssid.copy_from_slice(&param[2..8]);  
-  
-    let vif_idx = param[9];  
-    let ap_idx = param[10];  
-    let ch_idx = param[11];  
-    let qos = param[12] != 0;  
-  
-    // aid 在 2B padding + 800B assoc_ie_buf 之后，偏移 820（不是 818）  
-    let aid = if param.len() >= 822 {  
-        u16::from_le_bytes([param[820], param[821]])  
+    // ===== 提取 Association Request IEs =====  
+    // assoc_ie_buf 从 offset 20 开始，前 assoc_req_ie_len 字节是 AssocReq IEs  
+    // 后 assoc_rsp_ie_len 字节是 AssocRsp IEs（与 Linux rwnx_msg_rx.c:821-823 一致）  
+    const IE_BUF_OFFSET: usize = 20;  
+    let assoc_req_ies = if param.len() >= IE_BUF_OFFSET + assoc_req_ie_len && assoc_req_ie_len > 0 {  
+        let ies = param[IE_BUF_OFFSET..IE_BUF_OFFSET + assoc_req_ie_len].to_vec();  
+        log::info!(  
+            "[wifi_mgr] AssocReq IEs: len={}, data={:02x?}",  
+            ies.len(), &ies[..ies.len().min(64)]  
+        );  
+          
+        // 搜索 RSN IE (tag=0x30) 并打印  
+        let mut offset = 0;  
+        while offset + 2 <= ies.len() {  
+            let tag = ies[offset];  
+            let len = ies[offset + 1] as usize;  
+            if offset + 2 + len > ies.len() {  
+                break;  
+            }  
+            if tag == 0x30 {  
+                let rsn = &ies[offset..offset + 2 + len];  
+                log::info!("[wifi_mgr] >>> AssocReq RSN IE (firmware sent): {:02x?}", rsn);  
+                break;  
+            }  
+            offset += 2 + len;  
+        }  
+          
+        ies  
     } else {  
-        log::warn!("[wifi_mgr] SM_CONNECT_IND too short for aid field ({} bytes), defaulting to 0", param.len());  
-        0  
+        log::warn!(  
+            "[wifi_mgr] Cannot extract AssocReq IEs: param_len={}, ie_buf_offset={}, assoc_req_ie_len={}, assoc_rsp_ie_len={}",  
+            param.len(), IE_BUF_OFFSET, assoc_req_ie_len, assoc_rsp_ie_len  
+        );  
+        Vec::new()  
     };  
-
-    log::info!(  
-        "[wifi_mgr] SM_CONNECT_IND param_len={}, status={}, bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
-        param.len(), status_code,  
-        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]  
-    );
-  
-    Ok(ConnectResult {  
-        status_code,  
-        bssid,  
-        vif_idx,  
-        ap_idx,  
-        ch_idx,  
-        qos,  
-        aid,  
-    })  
+    
+    Ok(ConnectResult {    
+        status_code,    
+        bssid,    
+        vif_idx,    
+        ap_idx,    
+        ch_idx,    
+        qos,    
+        aid,    
+        assoc_req_ies,  
+    })    
 }
 
 // ================================================================

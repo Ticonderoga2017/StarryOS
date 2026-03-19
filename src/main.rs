@@ -183,6 +183,16 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
   
     info!("========== LMAC Config End ==========");  
   
+    // ========== Crypto Self-Test ==========  
+    info!("========== Crypto Self-Test ==========");  
+    let crypto_ok = aic8800_fdrv::wpa2::run_crypto_self_test();  
+    if !crypto_ok {  
+        error!("[FATAL] Crypto self-test FAILED! Handshake will not work.");  
+        return Err(CmdError::FirmwareError);  
+    }  
+    info!("========== Crypto Self-Test PASSED ==========");
+    aic8800_fdrv::wpa2::run_ptk_test();
+
     // ========== Phase 2: Scan ==========  
     let results = scan(bus, vif_idx, None, 20000)?;  
     info!("[SCAN] Found {} APs", results.len());  
@@ -218,6 +228,16 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         info!("[CONNECT] Open network (no RSN IE, no Privacy bit)");  
         Vec::new()  
     };
+    
+    let mut handshake = Wpa2Handshake::new(    
+        password,    
+        target_ssid,    
+        &ap.bssid,     // AA (Authenticator Address)    
+        &sta_mac,      // SPA (Supplicant Address)    
+        // &handshake_rsn_ie,  // 使用固件实际发送的 RSN IE  
+        &rsn_ie,
+    );
+    info!("[WPA2] PMK ready, now connecting...");  
 
     let connect_result = connect(  
         bus, vif_idx, target_ssid, &ap.bssid,  
@@ -226,13 +246,6 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   
     // ========== Phase 4: WPA2 Handshake ==========  
-    let mut handshake = Wpa2Handshake::new(  
-        password,  
-        target_ssid,  
-        &ap.bssid,     // AA (Authenticator Address)  
-        &sta_mac,      // SPA (Supplicant Address)  
-        &rsn_ie,  
-    );  
   
     loop {  
         let eapol = wait_for_eapol(bus, 10000)?;  
@@ -241,12 +254,12 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         match handshake.process_eapol(&eapol) {  
             Ok(HandshakeAction::SendM2(m2)) => {  
                 info!("[WPA2] Sending M2: {} bytes", m2.len());  
-                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2)?;  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &m2, vif_idx, connect_result.ap_idx)?;  
             }  
             Ok(HandshakeAction::Completed(result)) => {  
                 // 发送 M4  
                 info!("[WPA2] Sending M4: {} bytes", result.m4_frame.len());  
-                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame)?;  
+                send_eapol_data_frame(bus, &ap.bssid, &sta_mac, &result.m4_frame, vif_idx, connect_result.ap_idx)?;  
   
                 // 安装 PTK  
                 send_key_add_req(  
