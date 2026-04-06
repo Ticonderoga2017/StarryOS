@@ -252,7 +252,7 @@ pub const SDIOCLK_FREE_RUNNING_BIT: u8 = 1 << 6;
 // ============== SDIO 帧类型标识 ==============  
   
 /// 数据帧  
-pub const SDIO_TYPE_DATA: u8 = 0x00;  
+pub const SDIO_TYPE_DATA: u8 = 0x01;  
 /// 配置帧 (通用 / 类型判断 mask)  
 pub const SDIO_TYPE_CFG: u8 = 0x10;  
 /// 配置帧 - 命令响应 (CMD CFM)  

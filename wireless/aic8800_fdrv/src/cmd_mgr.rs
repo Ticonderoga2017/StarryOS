@@ -2,11 +2,11 @@ use aic8800_sdio::SdioHost;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::future::poll_fn;
+use core::{future::poll_fn, time::Duration};
 use core::sync::atomic::Ordering;
 use core::task::Poll;
 
-use axtask::future::block_on;
+use axtask::future::{self, block_on};
 use log;
 
 use crate::{bus::{BusState, WifiBus}, lmac_msg::*};
@@ -1311,67 +1311,55 @@ pub fn send_get_mac_addr_req(
     } 
 }
 
-/// 等待 EAPOL 帧（从 eapol_queue 中取出）  
-///  
-/// 返回完整的 EAPOL 帧（从 802.1X Version 字段开始，不含 Ethernet 头）  
-pub fn wait_for_eapol(  
-    bus: &Arc<WifiBus>,  
-    timeout_ms: u64,  
-) -> Result<Vec<u8>, CmdError> {
-    let timeout_ns = timeout_ms * 1_000_000;  
-    let start = axhal::time::monotonic_time_nanos();  
-
-    let result = block_on(poll_fn(|cx| {
-        // 检查超时  
-        let elapsed = axhal::time::monotonic_time_nanos() - start;  
-        if elapsed > timeout_ns {  
-            log::error!("[cmd_mgr] wait_for_eapol timeout ({}ms)", timeout_ms);  
-            return Poll::Ready(Err(CmdError::Timeout));  
-        } 
-
-        // 尝试从 eapol_queue 取出 
-        {
-            let mut queue = bus.eapol_queue.lock();  
-            if !queue.is_empty() {  
-                // If multiple EAPOL frames queued (AP retransmissions),  
-                // use the latest one (last in queue)  
-                let count = queue.len();  
-                if count > 1 {  
-                    log::warn!(  
-                        "[cmd_mgr] {} EAPOL frames in queue, using latest (draining {} stale)",  
-                        count, count - 1  
-                    );  
-                }  
-                // Drain all but the last  
-                while queue.len() > 1 {  
-                    queue.pop_front();  
-                }  
-                let eapol = queue.pop_front().unwrap();  
-                log::info!(  
-                    "[cmd_mgr] EAPOL frame received: {} bytes",  
-                    eapol.len()  
-                );  
-                return Poll::Ready(Ok(eapol));  
-            }
-        }
-
-        // 注册 waker  
-        bus.eapol_pollset.register(cx.waker()); 
-
-        // 双重检查  
+/// 等待 EAPOL 帧（从 eapol_queue 中取出）    
+///    
+/// 返回完整的 EAPOL 帧（从 802.1X Version 字段开始，不含 Ethernet 头）    
+pub fn wait_for_eapol(    
+    bus: &Arc<WifiBus>,    
+    timeout_ms: u64,    
+) -> Result<Vec<u8>, CmdError> {  
+    let timeout = Some(Duration::from_millis(timeout_ms));  
+  
+    let fut = poll_fn(|cx| {  
+        // 尝试从 eapol_queue 取出    
         {  
-            let mut queue = bus.eapol_queue.lock();  
-            if let Some(eapol) = queue.pop_front() {  
-                return Poll::Ready(Ok(eapol));  
+            let mut queue = bus.eapol_queue.lock();    
+            if let Some(eapol) = queue.pop_front() {    
+                // 清除剩余的过期帧（AP 重传的旧 M1 等）    
+                queue.clear();    
+                log::info!(    
+                    "[cmd_mgr] EAPOL frame received: {} bytes",    
+                    eapol.len()    
+                );    
+                return Poll::Ready(eapol);    
             }  
-        }
-
-        // 也用 wake_by_ref 做轮询 fallback  
-        cx.waker().wake_by_ref();  
-        Poll::Pending  
-    }));
-
-    result
+        }  
+  
+        // 注册 waker，等待 RX 线程通过 eapol_pollset.wake() 唤醒    
+        bus.eapol_pollset.register(cx.waker());   
+  
+        // 双重检查：防止 register 之前 RX 线程已 push + wake    
+        {    
+            let mut queue = bus.eapol_queue.lock();    
+            if let Some(eapol) = queue.pop_front() {    
+                queue.clear();    
+                return Poll::Ready(eapol);    
+            }    
+        }  
+  
+        // 不调用 cx.waker().wake_by_ref()！    
+        // 依赖 eapol_pollset.wake()（来自 RX 线程）唤醒本任务，    
+        // 超时由 future::timeout 处理。    
+        Poll::Pending    
+    });  
+  
+    match block_on(future::timeout(timeout, fut)) {  
+        Ok(eapol) => Ok(eapol),  
+        Err(_timeout) => {  
+            log::error!("[cmd_mgr] wait_for_eapol timeout ({}ms)", timeout_ms);  
+            Err(CmdError::Timeout)  
+        }  
+    }  
 }
 
 /// 发送 EAPOL DATA 帧  
@@ -1431,17 +1419,17 @@ pub fn send_eapol_data_frame(
     hd[0..2].copy_from_slice(&(payload_len as u16).to_le_bytes());  
     // flags_ext = 0  
     // hostid: 设置 bit 31 表示需要 TX 确认
-    hd[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes());  
+    hd[4..8].copy_from_slice(&0x8000_0000u32.to_le_bytes());  
     // flags_ext = 0  
     // hostid = 0  
     // eth_dest_addr [8..14]  
     hd[8..14].copy_from_slice(dst_mac);  
     // eth_src_addr [14..20]  
     hd[14..20].copy_from_slice(src_mac);  
-    // ethertype [20..22] = 0x888E (网络字节序，与 Linux 一致：直接拷贝 h_proto)  
+    // ethertype [20..22] = 0x888E (网络字节序)  
     hd[20..22].copy_from_slice(&0x888Eu16.to_be_bytes());  
     // ac = 0 (BE)  
-    hd[22] = 0;  
+    hd[22] = 1;  
     hd[23] = 0;  
     // vif_idx = 0  
     hd[24] = vif_idx;  

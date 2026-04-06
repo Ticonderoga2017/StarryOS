@@ -25,7 +25,7 @@ use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 pub const ETH_P_PAE: u16 = 0x888E;  
   
 /// EAPOL 版本  
-const EAPOL_VERSION: u8 = 0x01; // 802.1X-2004  
+const EAPOL_VERSION: u8 = 0x02; // 802.1X-2004  
   
 /// EAPOL 类型  
 const EAPOL_TYPE_KEY: u8 = 0x03;  
