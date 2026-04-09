@@ -582,6 +582,12 @@ impl Wpa2Handshake {
         }  
     }  
 
+    /// 更新握手使用的 RSN IE（当固件修改了 Association Request 中的 RSN IE 时调用）  
+    pub fn update_rsn_ie(&mut self, new_rsn_ie: &[u8]) {  
+        log::info!("[wpa2] Updating RSN IE: old={:02x?}, new={:02x?}", &self.rsn_ie, new_rsn_ie);  
+        self.rsn_ie = new_rsn_ie.to_vec();  
+    }
+
     /// 处理收到的 EAPOL 帧，返回需要执行的动作  
     ///  
     /// `eapol` 是完整的 EAPOL 帧（从 802.1X Version 字段开始，不含 Ethernet 头） 

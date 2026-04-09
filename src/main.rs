@@ -245,6 +245,32 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     )?;  
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
   
+    // 从 SM_CONNECT_IND 的 AssocReq IEs 中提取固件实际发送的 RSN IE  
+    // 如果固件修改了 RSN IE，必须用修改后的版本进行握手  
+    if !connect_result.assoc_req_ies.is_empty() {  
+        let mut offset = 0;  
+        let ies = &connect_result.assoc_req_ies;  
+        while offset + 2 <= ies.len() {  
+            let tag = ies[offset];  
+            let len = ies[offset + 1] as usize;  
+            if offset + 2 + len > ies.len() {  
+                break;  
+            }  
+            if tag == 0x30 {  
+                let fw_rsn = &ies[offset..offset + 2 + len];  
+                if fw_rsn != rsn_ie.as_slice() {  
+                    info!("[WPA2] Firmware RSN IE differs from ours, updating handshake");  
+                    info!("[WPA2]   ours:     {:02x?}", &rsn_ie);  
+                    info!("[WPA2]   firmware: {:02x?}", fw_rsn);  
+                    handshake.update_rsn_ie(fw_rsn);  
+                } else {  
+                    info!("[WPA2] Firmware RSN IE matches ours");  
+                }  
+                break;  
+            }  
+            offset += 2 + len;  
+        }  
+    }
     // ========== Phase 4: WPA2 Handshake ==========  
   
     loop {  
