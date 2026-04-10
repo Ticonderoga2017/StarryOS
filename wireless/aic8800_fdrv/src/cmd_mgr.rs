@@ -533,11 +533,12 @@ pub fn send_mm_add_if_req(
     mac_addr: &[u8; 6],
     timeout_ms: u64
 ) -> Result<u8, CmdError> {
-    // mm_add_if_req: type(1) + addr(6) + p2p(1) = 8 bytes
-    let mut param = [0u8; 8];
-    param[0] = MM_STA;                    // type = STA
-    param[1..7].copy_from_slice(mac_addr); // MAC address
-    param[7] = 0;                          // p2p = false
+    let mut param = [0u8; 10];  // sizeof(mm_add_if_req) with alignment = 10  
+    param[0] = MM_STA;                     // type at offset 0  
+    // param[1] = 0 (padding for mac_addr alignment)  
+    param[2..8].copy_from_slice(mac_addr); // addr at offset 2  
+    param[8] = 0;                          // p2p at offset 8  
+    // param[9] = 0 (trailing padding)
 
     log::info!(
         "[lmac] sending MM_ADD_IF_REQ (STA, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
@@ -1428,9 +1429,8 @@ pub fn send_eapol_data_frame(
     hd[14..20].copy_from_slice(src_mac);  
     // ethertype [20..22] = 0x888E (网络字节序)  
     hd[20..22].copy_from_slice(&0x888Eu16.to_be_bytes());  
-    // ac = 0 (BE)  
-    hd[22] = 1;  
-    hd[23] = 0;  
+    hd[22] = 3;  
+    hd[23] = 7;  
     // vif_idx = 0  
     hd[24] = vif_idx;  
     // staid = 0 (AP's sta_idx from SM_CONNECT_IND)  

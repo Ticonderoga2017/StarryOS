@@ -244,6 +244,11 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         ap.center_freq, &rsn_ie, 15000, 
     )?;  
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
+    info!(  
+        "[DEBUG] assoc_req_ies len={}, data={:02x?}",  
+        connect_result.assoc_req_ies.len(),  
+        &connect_result.assoc_req_ies[..connect_result.assoc_req_ies.len().min(32)]  
+    );
   
     // 从 SM_CONNECT_IND 的 AssocReq IEs 中提取固件实际发送的 RSN IE  
     // 如果固件修改了 RSN IE，必须用修改后的版本进行握手  

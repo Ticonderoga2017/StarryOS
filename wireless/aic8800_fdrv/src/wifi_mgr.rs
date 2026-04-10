@@ -453,12 +453,7 @@ pub fn build_wpa2_rsn_ie_from_ap(ap_rsn_ie: &[u8]) -> Vec<u8> {
         &[0x00, 0x0F, 0xAC, 0x02]  
     };  
 
-    // 复制 AP 的 RSN Capabilities（最后 2 字节）  
-    let rsn_cap = if ap_rsn_ie.len() >= 22 {  
-        [ap_rsn_ie[20], ap_rsn_ie[21]]  // 直接用 AP 的值  
-    } else {  
-        [0x00, 0x00]  
-    }; 
+    let rsn_cap = [0x00, 0x00];  // 始终使用 0x0000，避免固件修改导致不匹配
     
     let mut ie = Vec::with_capacity(22);  
     ie.push(0x30);       // Element ID: RSN  
