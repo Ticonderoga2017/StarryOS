@@ -182,16 +182,6 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     info!("[LMAC] add_if OK: vif_index={}", vif_idx);  
   
     info!("========== LMAC Config End ==========");  
-  
-    // ========== Crypto Self-Test ==========  
-    info!("========== Crypto Self-Test ==========");  
-    let crypto_ok = aic8800_fdrv::wpa2::run_crypto_self_test();  
-    if !crypto_ok {  
-        error!("[FATAL] Crypto self-test FAILED! Handshake will not work.");  
-        return Err(CmdError::FirmwareError);  
-    }  
-    info!("========== Crypto Self-Test PASSED ==========");
-    aic8800_fdrv::wpa2::run_ptk_test();
 
     // ========== Phase 2: Scan ==========  
     let results = scan(bus, vif_idx, None, 20000)?;  

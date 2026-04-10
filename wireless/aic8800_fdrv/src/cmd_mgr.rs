@@ -540,12 +540,6 @@ pub fn send_mm_add_if_req(
     param[8] = 0;                          // p2p at offset 8  
     // param[9] = 0 (trailing padding)
 
-    log::info!(
-        "[lmac] sending MM_ADD_IF_REQ (STA, mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-        mac_addr[0], mac_addr[1], mac_addr[2],
-        mac_addr[3], mac_addr[4], mac_addr[5]
-    );
-
     let rsp = send_cmd(bus, MM_ADD_IF_REQ, TASK_MM, &param, timeout_ms)?;
 
     // mm_add_if_cfm:
