@@ -7,6 +7,7 @@ pub mod tx_thread;
 pub mod lmac_msg;
 pub mod wifi_mgr;
 pub mod wpa2;
+pub mod net_dev;
 
 extern crate alloc;
   

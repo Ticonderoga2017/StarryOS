@@ -109,7 +109,6 @@ fn process_rx_frames(bus: &WifiBus) {
             break;
         }
 
-        log::trace!("[wifi-rx] block_cnt={}", block_cnt);  
         let data_len = (block_cnt as usize) * SDIOWIFI_FUNC_BLOCKSIZE;  
         let mut buf = vec![0u8; data_len]; 
         {
@@ -310,20 +309,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                 offset += advance;  
                 continue;  
             }
-
-            // 在 ethertype 检测之前添加  
-            log::info!(  
-                "[wifi-rx] LLC/SNAP check: [{:02x}, {:02x}, {:02x}] at llc_offset={}",  
-                mpdu[llc_offset], mpdu[llc_offset+1], mpdu[llc_offset+2], llc_offset  
-            );
-
-            // 可选：验证 LLC/SNAP 头 (AA AA 03)  
-            // if mpdu[llc_offset] != 0xAA || mpdu[llc_offset+1] != 0xAA || mpdu[llc_offset+2] != 0x03 {  
-            //     // 非 LLC/SNAP 封装，跳过  
-            //     offset += advance;  
-            //     continue;  
-            // }  
-  
             let ethertype = u16::from_be_bytes([  
                 mpdu[ether_type_offset],  
                 mpdu[ether_type_offset + 1],  
@@ -350,10 +335,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                     } else {
                         raw_eapol.to_vec() 
                     };
-                    log::info!(  
-                        "[wifi-rx] EAPOL frame detected, eapol_len={}, decr={}",  
-                        eapol.len(), decr_status  
-                    );  
                     let mut queue = bus.eapol_queue.lock();  
                     queue.push_back(eapol);  
                     drop(queue);  
@@ -376,6 +357,7 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                     }  
                     queue.push_back(eth_frame);  
                     drop(queue);  
+                    bus.data_rx_pollset.wake();
                 } 
             }
             offset += advance; 

@@ -181,6 +181,22 @@ fn tx_process(bus: &WifiBus) -> bool {
     }
 
     // ---- Step 2: Data 发送（对应 Linux aicwf_sdio_bustx_thread 的数据处理）----
+    const SDIO_HEADER_LEN: usize = 4;
+    const HOSTDESC_SIZE: usize = 28;
+    const ETH_HEADER_LEN: usize = 14;
+
+    let vif_idx = bus.connected_vif_idx.load(Ordering::Acquire);
+    let sta_idx = bus.connected_sta_idx.load(Ordering::Acquire);
+
+    // 未连接则跳过所有数据帧  
+    if vif_idx == 0xFF {
+        // 清空队列，避免积压  
+        while let Some(_) = bus.tx_queue.lock().pop_front() {
+            bus.tx_pktcnt.fetch_sub(1, Ordering::AcqRel);
+        }
+        return did_work;
+    }
+
     // 检查有帧可发
     let mut batch_count: u32 = 0;  
     while bus.tx_pktcnt.load(Ordering::Acquire) > 0 {
@@ -200,24 +216,17 @@ fn tx_process(bus: &WifiBus) -> bool {
         }         
 
         let sdio = bus.sdio.lock();
-
         // 检查 flow control credits
         let fc = match sdio.read_byte(1, SDIOWIFI_FLOW_CTRL_REG) {
             Ok(v) => v & SDIOWIFI_FLOWCTRL_MASK,
             Err(_) => break,
         };
-
-        if batch_count < 3 {  
-            log::debug!("[wifi-tx] DATA flow_ctrl: credits={}", fc);  
-        }  
+        drop(sdio);
 
         if fc <= DATA_FLOW_CTRL_THRESH {
             // credits 不足，等下次唤醒  
             break;
         }
-
-        // 释放 SDIO 锁再操作队列（避免持锁时间过长）  
-        drop(sdio);  
 
         // 从队列取帧
         let frame = bus.tx_queue.lock().pop_front();
@@ -226,9 +235,24 @@ fn tx_process(bus: &WifiBus) -> bool {
         };
         bus.tx_pktcnt.fetch_sub(1, Ordering::AcqRel);
 
-        // 构造 sdio_header + payload
-        let total_len = frame.data.len() + 4;
-        let aligned_len = align_up(total_len, TX_ALIGNMENT);
+        let eth_frame = &frame.data;
+        if eth_frame.len() < ETH_HEADER_LEN {
+            continue; // 不合法的以太网帧，丢弃
+        }
+
+        // ---- 剥离以太网头，提取字段 ----  
+        let eth_dest = &eth_frame[0..6];
+        let eth_src = &eth_frame[6..12];
+        let ethertype = &eth_frame[12..14];
+        let payload = &eth_frame[ETH_HEADER_LEN..];
+        let payload_len = payload.len();
+
+        // ---- 计算长度和对齐 ----  
+        let sdio_payload_len = payload_len + HOSTDESC_SIZE; // 以太网负载 + HostDesc
+        let raw_len = sdio_payload_len + SDIO_HEADER_LEN; // 加上 SDIO header
+        let aligned_len = align_up(raw_len, TX_ALIGNMENT);
+        // SDIO header length 字段 = 对齐后总长 - SDIO header 本身(4)  
+        let sdio_hdr_len = aligned_len - SDIO_HEADER_LEN; // SDIO header 后到 HostDesc 之间的填充
 
         // TAIL_LEN + BLOCK_SIZE 对齐
         let final_len = if aligned_len % SDIOWIFI_FUNC_BLOCKSIZE != 0 {
@@ -238,25 +262,45 @@ fn tx_process(bus: &WifiBus) -> bool {
         };
 
         let mut buf = vec![0u8; final_len];
-        // sdio_header: [len_lo, len_hi | flags, type, reserved]  
-        buf[0] = (total_len & 0xFF) as u8;
-        buf[1] = ((total_len >> 8) & 0x0F) as u8;
+        // ---- SDIO header [0..4] ----  
+        buf[0] = (sdio_hdr_len & 0xFF) as u8;
+        buf[1] = ((sdio_hdr_len >> 8) & 0x0F) as u8;
         buf[2] = SDIO_TYPE_DATA;
         buf[3] = 0x00; // AIC8801: reserved=0; AIC8800D80: 需要 CRC8 
-        buf[4..4 + frame.data.len()].copy_from_slice(&frame.data);
 
-        // 重新获取 SDIO 锁发送  
-        let sdio = bus.sdio.lock(); 
+        // ---- hostdesc [4..32] ----  
+        let hd = &mut buf[SDIO_HEADER_LEN..SDIO_HEADER_LEN + HOSTDESC_SIZE];
+        // packet_len [0..2]: payload 长度（不含以太网头、不含 hostdesc） 
+        hd[0..2].copy_from_slice(&(payload_len as u16).to_le_bytes());
+        // flags_ext [2..4] = 0  
+        // hostid [4..8] = 0（普通数据帧不需要 TX CFM，减少固件→主机流量）  
+        // eth_dest_addr [8..14]  
+        hd[8..14].copy_from_slice(eth_dest);
+        // eth_src_addr [14..20]  
+        hd[14..20].copy_from_slice(eth_src);
+        // ethertype [20..22]（网络字节序，直接拷贝，与 Linux desc->host.ethertype = eth_t.h_proto 一致） 
+        hd[20..22].copy_from_slice(ethertype);
+        // ac [22] = 1 (BE)  
+        hd[22] = 1;  
+        // tid [23] = 0 (BE, 0xFF = non-QoS)  
+        hd[23] = 0;  
+        // vif_idx [24]
+        hd[24] = vif_idx;
+        // sta_idx [25]
+        hd[25] = sta_idx;
+        // flags [26..28] = 0
+
+        // ---- payload [32..] ----  
+        let ps = SDIO_HEADER_LEN + HOSTDESC_SIZE;
+        buf[ps..ps + payload_len].copy_from_slice(payload);
+
+        // ---- 发送 ----  
+        let sdio = bus.sdio.lock();
         if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &buf) {
-            log::error!("[wifi-tx] DATA write_fifo failed: {:?}", e);  
-        } else {
-            // 发送后 unmask CARD_INT  
-            let base = bus.sdio_mmio_base.load(Ordering::Acquire);  
-            if base != 0 {  
-                mask_unmask_card_irq_raw(base, false);  
-            }  
-            bus.rx_irq_pollset.wake();  
+            log::error!("[wifi-tx] DATA write_fifo failed: {:?}", e); 
         }
+        drop(sdio);
+
         did_work = true;    
         batch_count += 1;
     }

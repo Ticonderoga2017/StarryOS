@@ -109,7 +109,6 @@ fn sdio1_probe() {
                                 error!("[wifi] FAILED: {:?}", e);  
                             }                            
 
-                            bus.dump_status(); // 打印完整状态  
                             core::mem::forget(bus); // 临时 leak                              
                         }  
                         Err(e) => error!("FDRV init FAILED: {}", e),  
@@ -313,6 +312,13 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
                     bus, connect_result.ap_idx, true, 5000,  
                 )?;  
                 info!("[WPA2] Control port opened, connected!");  
+
+                bus.connected_vif_idx.store(vif_idx, Ordering::Release);
+                bus.connected_sta_idx.store(connect_result.ap_idx, Ordering::Release);
+                bus.connected_sta_mac.lock().replace(sta_mac);
+                bus.connected_ap_mac.lock().replace(ap.bssid);
+                info!("[NET] Connection state saved: vif={}, sta={}", vif_idx, connect_result.ap_idx);
+                
                 break;  
             }  
             Err(e) => { 

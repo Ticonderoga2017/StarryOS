@@ -1,5 +1,5 @@
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use axpoll::PollSet;
 use axsync::Mutex;
 use kspin::SpinNoIrq;
@@ -79,6 +79,11 @@ pub struct WifiBus {
     pub ind_pollset: PollSet, // indication 到达通知
 
     pub cmd_expected_cfm_id: AtomicU16, // 当前等待的 CFM msg_id
+
+    pub connected_vif_idx: AtomicU8, // 当前连接的 VIF 索引（0-7），0xFF 表示未连接
+    pub connected_sta_idx: AtomicU8, // 当前连接的 STA 索引（0-7），0xFF 表示未连接
+    pub connected_sta_mac: SpinNoIrq<Option<[u8; 6]>>, // 当前连接的 STA MAC 地址
+    pub connected_ap_mac: SpinNoIrq<Option<[u8; 6]>>, // 当前连接的 AP MAC 地址
 }
 
 impl WifiBus {
@@ -112,6 +117,10 @@ impl WifiBus {
             ind_queue: SpinNoIrq::new(VecDeque::new()),
             ind_pollset: PollSet::new(),
             cmd_expected_cfm_id: AtomicU16::new(0),
+            connected_vif_idx: AtomicU8::new(0xFF),
+            connected_sta_idx: AtomicU8::new(0xFF),
+            connected_sta_mac: SpinNoIrq::new(None),
+            connected_ap_mac: SpinNoIrq::new(None),
         })
     }
 
@@ -155,44 +164,6 @@ impl WifiBus {
     
         log::info!("[wifi-bus] shutdown: interrupts disabled, threads notified"); 
     }
-
-      pub fn dump_status(&self) {  
-        let base = self.sdio_mmio_base.load(Ordering::Relaxed);  
-        let irq_cnt = IRQ_COUNT.load(Ordering::Relaxed);  
-        let state = *self.state.lock();  
-        let tx_pktcnt = self.tx_pktcnt.load(Ordering::Relaxed);  
-        let cmd_pending = self.cmd_pending_flag.load(Ordering::Relaxed);  
-        let cmd_error = self.cmd_rsp_error.load(Ordering::Relaxed);  
-  
-        log::info!("=== WifiBus Status ===");  
-        log::info!("  mmio_base: 0x{:x}", base);  
-        log::info!("  state: {:?}", state);  
-        log::info!("  irq_count: {}", irq_cnt);  
-        log::info!("  tx_pktcnt: {}", tx_pktcnt);  
-        log::info!("  cmd_pending: {}", cmd_pending);  
-        log::info!("  cmd_rsp_error: {}", cmd_error);  
-        log::info!("  cmd_rsp_queue len: {}", self.cmd_rsp_queue.lock().len());  
-        log::info!("  data_rx_queue len: {}", self.data_rx_queue.lock().len());  
-        log::info!("  tx_queue len: {}", self.tx_queue.lock().len());  
-  
-        if base != 0 {  
-            unsafe {  
-                let norm_sts = core::ptr::read_volatile(  
-                    (base + 0x30) as *const u16  
-                );  
-                let err_sts = core::ptr::read_volatile(  
-                    (base + 0x32) as *const u16  
-                );  
-                let sig_en = core::ptr::read_volatile(  
-                    (base + 0x38) as *const u16  
-                );  
-                log::info!("  SDHCI NORM_INT_STS: 0x{:04x}", norm_sts);  
-                log::info!("  SDHCI ERR_INT_STS:  0x{:04x}", err_sts);  
-                log::info!("  SDHCI NORM_SIG_EN:  0x{:04x}", sig_en);  
-            }  
-        }  
-        log::info!("======================");  
-    }  
 }
 
 /// 全局 WifiBus 引用（init 后设置，ISR 读取）
