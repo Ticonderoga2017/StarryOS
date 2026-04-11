@@ -129,6 +129,7 @@ fn sdio1_probe() {
 
 #[cfg(feature = "sg2002")]
 fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {  
+    use core::sync::atomic::Ordering;
     // ========== Phase 1: LMAC Configuration ==========  
     info!("========== LMAC Config Start ==========");  
   
@@ -319,6 +320,15 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
                 bus.connected_ap_mac.lock().replace(ap.bssid);
                 info!("[NET] Connection state saved: vif={}, sta={}", vif_idx, connect_result.ap_idx);
                 
+                aic8800_fdrv::net_dev::register_wifi_device(  
+                    Arc::clone(bus),  
+                    sta_mac,  
+                    "192.168.1.15",   // IP 地址  
+                    24,                // 子网前缀  
+                    "192.168.1.1",     // 网关  
+                );  
+                info!("[NET] Wi-Fi network device registered, ready for TCP/UDP");  
+
                 break;  
             }  
             Err(e) => { 

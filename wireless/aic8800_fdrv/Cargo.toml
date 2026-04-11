@@ -20,3 +20,8 @@ sha1 = { version = "0.10", default-features = false }
 digest = { version = "0.10", default-features = false }  
 aes = { version = "0.8", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false }
+
+axdriver_base = { git = "https://github.com/arceos-org/axdriver_crates.git", tag = "dev-v01" }  
+axdriver_net = { git = "https://github.com/arceos-org/axdriver_crates.git", tag = "dev-v01" }  
+axnet = { path = "../../arceos/modules/axnet" }  
+axdriver = { path = "../../arceos/modules/axdriver" }
