@@ -40,12 +40,6 @@ pub fn start(bus: Arc<WifiBus>) {
                     RX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
 
-                // 打印后重置 RX_WAKE_COUNT，使其反映"自上次处理以来的中断次数"  
-                let cnt = RX_WAKE_COUNT.swap(0, Ordering::Relaxed);  
-                if cnt > 0 {  
-                    log::trace!("[wifi-rx] woke up (count={})", cnt);  
-                } 
-
                 // 处理所有待读数据
                 process_rx_frames(&bus);
 
@@ -122,10 +116,8 @@ fn process_rx_frames(bus: &WifiBus) {
         dispatch_frames(bus, &buf);        
     }
 
-    let base = bus.sdio_mmio_base.load(Ordering::Acquire);
-    if base != 0 {
-        mask_unmask_card_irq_raw(base, false);
-    }    
+    let sdio = bus.sdio.lock();  // 等待 TX 线程释放锁  
+    sdio.enable_irq();           // 直接写 NORM_INT_SIG_EN = 0x0100 
 }
 
 /// 解析 SDIO FIFO 中的聚合帧并按类型分发  
@@ -209,11 +201,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
             // 802.11 payload 从 offset+4 开始，长度 = pkt_len - 4（去掉 SDIO header）  
             // hw_rxhdr 从 offset+pkt_len 开始，长度 = RX_HWHRD_LEN  
             let data_payload = &buf[offset..offset + aggr_len];  
-            log::trace!(  
-                "[wifi-rx] DATA frame, pkt_len={}, aggr_len={}",  
-                pkt_len, aggr_len  
-            ); 
-
             // --- 从 hw_rxhdr 提取 decr_status ---  
             let decr_status = if data_payload.len() > HWVECT_STATUS_OFFSET {
                 (data_payload[HWVECT_STATUS_OFFSET] >> 2) & 0x07  
@@ -356,6 +343,7 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                         queue.pop_front(); // 丢弃最旧的帧  
                     }  
                     queue.push_back(eth_frame);  
+                    log::info!("[wifi-rx] DATA frame enqueued, queue_len={}", queue.len());
                     drop(queue);  
                     bus.data_rx_pollset.wake();
                 } 

@@ -1277,6 +1277,32 @@ pub fn send_set_control_port_req(
     send_cmd(bus, ME_SET_CONTROL_PORT_REQ, TASK_ME, &param, timeout_ms)  
 }
 
+/// 发送 MM_SET_FILTER_REQ，配置固件 RX 过滤器  
+///  
+/// filter 是一个 u32 位掩码，控制固件转发哪些帧给主机。  
+/// Linux 驱动中 STA 模式的典型值：  
+///   NXMAC_ACCEPT_UNICAST_BIT    (1 << 0) = 0x01  
+///   NXMAC_ACCEPT_MULTICAST_BIT  (1 << 1) = 0x02  
+///   NXMAC_ACCEPT_BROADCAST_BIT  (1 << 2) = 0x04  
+///   NXMAC_ACCEPT_PROBE_REQ_BIT  (1 << 3) = 0x08 (AP 模式用)  
+///  
+/// STA 模式推荐值：0x07 (unicast + multicast + broadcast)  
+pub fn send_mm_set_filter_req(  
+    bus: &Arc<WifiBus>,  
+    filter: u32,  
+    timeout_ms: u64,  
+) -> Result<(), CmdError> {  
+    // mm_set_filter_req 结构体：  
+    //   [0..4] u32 filter (LE)  
+    let mut param = [0u8; 4];  
+    param[0..4].copy_from_slice(&filter.to_le_bytes());  
+  
+    log::info!("[cmd_mgr] sending MM_SET_FILTER_REQ: filter=0x{:08x}", filter);  
+    send_cmd(bus, MM_SET_FILTER_REQ, TASK_MM, &param, timeout_ms)?;  
+    log::info!("[cmd_mgr] MM_SET_FILTER_CFM OK");  
+    Ok(())  
+}
+
 /// MM_GET_MAC_ADDR_REQ / MM_GET_MAC_ADDR_CFM  
 /// 参考 Linux: rwnx_send_get_macaddr_req (rwnx_msg_tx.c:1334-1355)  
 ///  

@@ -23,6 +23,21 @@ fn main() {
     #[cfg(feature = "sg2002")]
     sdio1_probe();
 
+    // ===== 网络数据通路测试 =====  
+    // 在此期间从 PC 执行: ping 192.168.1.200  
+    #[cfg(feature = "sg2002")]  
+    aic8800_fdrv::net_dev::run_network_poll_loop(0); // 0 = 永久循环  
+    // ===== 网络速度测试 =====  
+    // #[cfg(feature = "sg2002")]  
+    // aic8800_fdrv::net_dev::run_speed_test(  
+    //     "192.168.1.15",  // PC 的 IP 地址（根据实际修改）  
+    //     9000,             // PC 监听的端口  
+    //     1_000_000,        // 发送 1MB 数据  
+    //     1024,             // 每次发送 1KB  
+    // );
+    // 测试完成后注释掉上面这行，恢复正常启动流程  
+    // ============================  
+
     let args = CMDLINE
         .iter()
         .copied()
@@ -180,6 +195,10 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     // MM_ADD_IF（使用真实 MAC）  
     let vif_idx = send_mm_add_if_req(bus, &sta_mac, 6000)?;  
     info!("[LMAC] add_if OK: vif_index={}", vif_idx);  
+
+    // 设置 RX 过滤器：接受单播 + 多播 + 广播帧  
+    send_mm_set_filter_req(bus, 0x1502868C, 5000)?;
+    info!("[LMAC] rx_filter set: 0x{:08x}", 0x1502868C);
   
     info!("========== LMAC Config End ==========");  
 
@@ -323,7 +342,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
                 aic8800_fdrv::net_dev::register_wifi_device(  
                     Arc::clone(bus),  
                     sta_mac,  
-                    "192.168.1.15",   // IP 地址  
+                    "192.168.1.200",   // IP 地址  
                     24,                // 子网前缀  
                     "192.168.1.1",     // 网关  
                 );  

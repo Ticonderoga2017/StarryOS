@@ -6,6 +6,7 @@
 use alloc::boxed::Box;
 use alloc::{sync::Arc, vec};
 use alloc::vec::Vec;
+use axnet::SocketOps;
 use core::{sync::atomic::Ordering, ptr::NonNull};
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
@@ -94,6 +95,7 @@ impl NetDriverOps for AicWifiNetDev {
     }
 
     fn transmit(&mut self, tx_buf: NetBufPtr) -> DevResult {
+        log::info!("[wifi-net] transmit() called, frame_len={}", tx_buf.packet_len());
         // Copy the Ethernet frame out of the NetBufPtr buffer.  
         let eth_frame: Vec<u8> = tx_buf.packet().to_vec();
         let buf_ptr = tx_buf.packet().as_ptr() as *mut u8;
@@ -102,7 +104,7 @@ impl NetDriverOps for AicWifiNetDev {
         // Free the TX buffer immediately (we already copied the data).  
         // NetBufPtr does NOT implement Drop, so we must free manually. 
         if let Some(nn) = NonNull::new(buf_ptr) {
-            unsafe { Self::free_buf(nn, buf_size); }
+            Self::free_buf(nn, buf_size); 
         }
         // Note: tx_buf goes out of scope here — no Drop, so this is fine.  
   
@@ -119,6 +121,10 @@ impl NetDriverOps for AicWifiNetDev {
     }
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
+        let queue_len = self.bus.data_rx_queue.lock().len();  
+        if queue_len > 0 {  
+            log::info!("[wifi-net] receive() called, queue_len={}", queue_len);  
+        }
         let frame = self.bus.data_rx_queue.lock().pop_front().ok_or(DevError::Again)?;
         let size = frame.len();
         let ptr = Self::alloc_buf(size).ok_or(DevError::NoMemory)?;
@@ -164,4 +170,159 @@ pub fn register_wifi_device(
     let boxed: Box<dyn NetDriverOps> = Box::new(dev);    
     axnet::register_net_device(boxed, ip, prefix, gateway);
     log::info!("[aic8800] Wi-Fi device registered with axnet");  
+}
+
+/// 简单的网络测试循环：持续 poll smoltcp，使系统能响应 ARP/ICMP。  
+/// 从外部 PC 执行 `ping <board_ip>` 即可验证数据通路。  
+/// 按需设置 duration_secs，0 表示永久循环。  
+pub fn run_network_poll_loop(duration_secs: u64) {  
+    log::info!("[net-test] Starting network poll loop ({}s)...", duration_secs);  
+    log::info!("[net-test] Try `ping {}` from your PC", "192.168.1.200");  
+  
+    let start = axhal::time::monotonic_time_nanos();  
+    let timeout_ns = duration_secs * 1_000_000_000;  
+  
+    loop {  
+        axnet::poll_interfaces();  
+        axtask::yield_now();  
+  
+        if duration_secs > 0 {  
+            let elapsed = axhal::time::monotonic_time_nanos() - start;  
+            if elapsed >= timeout_ns {  
+                log::info!("[net-test] Poll loop finished after {}s", duration_secs);  
+                break;  
+            }  
+        }  
+    }  
+}
+
+/// 读取 RISC-V time CSR（避免额外依赖 axhal）  
+fn rdtime() -> u64 {  
+    let time: u64;  
+    unsafe { core::arch::asm!("rdtime {}", out(reg) time) };  
+    time  
+}  
+  
+/// 将 ticks 转换为纳秒（SG2002 定时器频率 25MHz，NANOS_PER_TICK = 40）  
+const NANOS_PER_TICK: u64 = 40;  
+  
+fn ticks_to_nanos(ticks: u64) -> u64 {  
+    ticks * NANOS_PER_TICK  
+}  
+  
+/// 网络速度测试：TCP TX 吞吐量  
+///  
+/// 连接到 PC 上的 TCP 服务器，发送指定大小的数据，测量吞吐量。  
+/// PC 端需要先运行：`nc -l <port> > /dev/null` 或 `iperf3 -s -p <port>`  
+///  
+/// # Arguments  
+/// * `server_ip` - PC 的 IP 地址，如 "192.168.1.100"  
+/// * `server_port` - PC 监听的端口，如 9000  
+/// * `total_bytes` - 要发送的总字节数，如 1_000_000 (1MB)  
+/// * `chunk_size` - 每次 send 的块大小，如 1024  
+pub fn run_speed_test(server_ip: &str, server_port: u16, total_bytes: usize, chunk_size: usize) {  
+    use axnet::tcp::TcpSocket;  
+    use axnet::{SocketAddrEx, SendOptions};  
+    use core::net::{IpAddr, SocketAddr};  
+  
+    log::info!("[speed-test] ===== Network Speed Test =====");  
+    log::info!("[speed-test] Target: {}:{}", server_ip, server_port);  
+    log::info!("[speed-test] Total: {} bytes, Chunk: {} bytes", total_bytes, chunk_size);  
+  
+    // Phase 1: ARP warmup - poll interfaces to let ARP resolve  
+    log::info!("[speed-test] Phase 1: ARP warmup...");  
+    for _ in 0..500 {  
+        axnet::poll_interfaces();  
+        // 短暂忙等  
+        for _ in 0..1000 {  
+            core::hint::spin_loop();  
+        }  
+    }  
+  
+    // Phase 2: TCP connect  
+    log::info!("[speed-test] Phase 2: Connecting to {}:{}...", server_ip, server_port);  
+    let socket = TcpSocket::new();  
+  
+    let ip: IpAddr = server_ip.parse().expect("Invalid server IP");  
+    let remote = SocketAddr::new(ip, server_port);  
+  
+    if let Err(e) = socket.connect(SocketAddrEx::Ip(remote)) {  
+        log::error!("[speed-test] TCP connect failed: {:?}", e);  
+        log::info!("[speed-test] Make sure PC is running: nc -l {} > /dev/null", server_port);  
+        // Fall through to poll loop  
+        run_poll_loop();  
+        return;  
+    }  
+    log::info!("[speed-test] Connected!");  
+  
+    // Phase 3: TX throughput test  
+    log::info!("[speed-test] Phase 3: Sending {} bytes...", total_bytes);  
+  
+    let buf = alloc::vec![0xABu8; chunk_size];  
+    let mut total_sent: usize = 0;  
+    let mut send_errors: usize = 0;  
+  
+    let start_ticks = rdtime();  
+  
+    while total_sent < total_bytes {  
+        let remaining = total_bytes - total_sent;  
+        let to_send = if remaining < chunk_size { remaining } else { chunk_size };  
+        let data: &[u8] = &buf[..to_send];  
+  
+        match socket.send(data, SendOptions::default()) {  
+            Ok(n) => {  
+                total_sent += n;  
+            }  
+            Err(e) => {  
+                send_errors += 1;  
+                if send_errors > 100 {  
+                    log::error!("[speed-test] Too many send errors, aborting. Last: {:?}", e);  
+                    break;  
+                }  
+                // Brief pause then retry  
+                for _ in 0..100 {  
+                    axnet::poll_interfaces();  
+                    core::hint::spin_loop();  
+                }  
+            }  
+        }  
+    }  
+  
+    let end_ticks = rdtime();  
+    let elapsed_ns = ticks_to_nanos(end_ticks - start_ticks);  
+    let elapsed_ms = elapsed_ns / 1_000_000;  
+  
+    // Calculate throughput  
+    let bits = (total_sent as u64) * 8;  
+    let throughput_kbps = if elapsed_ns > 0 {  
+        bits * 1_000_000_000 / elapsed_ns / 1000  
+    } else {  
+        0  
+    };  
+    let throughput_mbps = throughput_kbps / 1000;  
+  
+    log::info!("[speed-test] ===== Results =====");  
+    log::info!("[speed-test] Sent: {} bytes", total_sent);  
+    log::info!("[speed-test] Time: {} ms", elapsed_ms);  
+    log::info!("[speed-test] Throughput: {} Kbps ({}.{} Mbps)",  
+        throughput_kbps, throughput_mbps, (throughput_kbps % 1000) / 100);  
+    log::info!("[speed-test] Send errors: {}", send_errors);  
+    log::info!("[speed-test] ====================");  
+  
+    // Shutdown socket  
+    drop(socket);  
+  
+    // Phase 4: Enter poll loop (respond to ping)  
+    run_poll_loop();  
+}  
+  
+/// 简单的网络轮询循环，响应 ARP 和 ICMP（ping）  
+pub fn run_poll_loop() {  
+    log::info!("[net-test] Entering poll loop. Ping me to verify connectivity!");  
+    loop {  
+        axnet::poll_interfaces();  
+        for _ in 0..10000 {  
+            core::hint::spin_loop();  
+        }  
+    }  
 }
