@@ -15,7 +15,7 @@ const TAIL_LEN: usize = 4;
 const BUFFER_SIZE: usize = 1536;  
 const FLOW_CTRL_CMD_RETRY: u32 = 10;  
 /// 每次 tx_process 最多处理的数据帧数，防止饿死其他任务  
-const TX_BATCH_LIMIT: u32 = 16;  
+const TX_BATCH_LIMIT: u32 = 64;  
 const MAX_TX_QUEUE_LEN: usize = 256;
 
 #[derive(Debug)]
@@ -106,8 +106,6 @@ fn tx_process(bus: &WifiBus) -> bool {
                 mask_unmask_card_irq_raw(base, true);
             }      
 
-            log::info!("[wifi-tx] CMD frame ready, send_len={}", send_len); 
-
             // Flow control for CMD（对应 Linux aicwf_sdio_tx_msg 中的 flow_ctrl_msg）
             let mut fc_ok = false;
             {
@@ -116,11 +114,7 @@ fn tx_process(bus: &WifiBus) -> bool {
                 for retry in 0..FLOW_CTRL_CMD_RETRY {
                     match sdio.read_byte(1, SDIOWIFI_FLOW_CTRL_REG) {
                         Ok(fc) => {
-                            let fc_val = fc & SDIOWIFI_FLOWCTRL_MASK;
-                            log::info!(  
-                                "[wifi-tx] CMD flow_ctrl: raw=0x{:02x}, credits={}, retry={}",  
-                                fc, fc_val, retry  
-                            ); 
+                            let fc_val = fc & SDIOWIFI_FLOWCTRL_MASK;    
                             if fc_val != 0 {
                                 // 额外检查：buffer_cnt * BUFFER_SIZE 必须 > send_len  
                                 // 对应 Linux: buffer_cnt > 0 && len < (buffer_cnt * BUFFER_SIZE) 
@@ -143,11 +137,9 @@ fn tx_process(bus: &WifiBus) -> bool {
 
                 // flow_ctrl 通过后，在同一个锁内直接 write_fifo  
                 if fc_ok {  
-                    log::info!("[wifi-tx] calling write_fifo...");  
                     if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &cmd) {  
                         log::error!("[wifi-tx] CMD write_fifo failed: {:?}", e);  
                     } else {  
-                        log::info!("[wifi-tx] CMD write_fifo OK");  
                         did_work = true;  
                     }  
                 }  
@@ -298,12 +290,6 @@ fn tx_process(bus: &WifiBus) -> bool {
         let sdio = bus.sdio.lock();
         if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &buf) {
             log::error!("[wifi-tx] DATA write_fifo failed: {:?}", e); 
-        } else {
-            log::info!(  
-                "[wifi-tx] DATA frame sent: dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, len={}, final_len={}",  
-                eth_dest[0], eth_dest[1], eth_dest[2], eth_dest[3], eth_dest[4], eth_dest[5],  
-                payload_len, final_len  
-            );  
         }
         drop(sdio);
 

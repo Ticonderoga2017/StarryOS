@@ -101,8 +101,6 @@ pub fn send_cmd_with_cfm_id(
     expected_cfm_id: u16,
     timeout_ms: u64
 ) -> Result<Vec<u8>, CmdError> {
-    log::info!("[cmd_mgr] send_cmd enter: msg_id=0x{:04x}", msg_id);
-
     // 检查总线状态  
     if *bus.state.lock() == BusState::Down {
         return Err(CmdError::BusDown);
@@ -168,10 +166,6 @@ pub fn send_cmd_with_cfm_id(
                 if rsp.len() >= LmacMsg::SIZE {
                     let msg = LmacMsg::from_le_bytes(&rsp);
                     if msg.id == expected_cfm_id {
-                        log::info!(  
-                            "[cmd_mgr] RX cfm_id=0x{:04x}, param_len={}, pattern=0x{:08x}",  
-                            msg.id, msg.param_len, msg.pattern  
-                        );
                         let param_start = LmacMsg::SIZE;
                         let param_end = param_start + msg.param_len as usize;
                         if rsp.len() >= param_end {
@@ -217,10 +211,6 @@ pub fn send_cmd_with_cfm_id(
                             return Poll::Ready(Ok(rsp[param_start..].to_vec()));  
                         } 
                     } else {
-                        log::info!(  
-                            "[cmd_mgr] IND routed (double-check): msg_id=0x{:04x}",  
-                            msg.id  
-                        );  
                         bus.ind_queue.lock().push_back(rsp);  
                         bus.ind_pollset.wake();  
                     }
@@ -236,9 +226,8 @@ pub fn send_cmd_with_cfm_id(
     // 清除期望的 CFM ID（无论成功、超时还是错误） 
     bus.cmd_expected_cfm_id.store(0, Ordering::Release);
 
-    match &result {  
-        Ok(rsp) => log::info!("[cmd_mgr] send_cmd 0x{:04x} OK, rsp_len={}", msg_id, rsp.len()),  
-        Err(e) => log::error!("[cmd_mgr] send_cmd 0x{:04x} FAILED: {:?}", msg_id, e),  
+    if let Err(e) = &result {
+        log::error!("[cmd_mgr] send_cmd 0x{:04x} error: {:?}", msg_id, e);
     }  
 
     result
@@ -292,7 +281,6 @@ pub fn send_txpwr_idx_req(
         9,   // ofdm256qam_5g
         9,   // ofdm1024qam_5g
     ];
-    log::info!("[lmac] sending MM_SET_TXPWR_IDX_LVL_REQ");
     send_cmd(bus, MM_SET_TXPWR_IDX_LVL_REQ, TASK_MM, &param, timeout_ms)?;
     Ok(())
 }
@@ -318,7 +306,6 @@ pub fn send_txpwr_ofst_req(
         0,  // chan_122_140
         0,  // chan_142_165
     ];
-    log::info!("[lmac] sending MM_SET_TXPWR_OFST_REQ");
     send_cmd(bus, MM_SET_TXPWR_OFST_REQ, TASK_MM, &param, timeout_ms)?;
     Ok(())
 }
@@ -351,14 +338,13 @@ pub fn send_rf_calib_req(
     param[20] = 0; // xtal_cap
     param[21] = 0; // xtal_cap_fine
 
-    log::info!("[lmac] sending MM_SET_RF_CALIB_REQ");
     let rsp = send_cmd(bus, MM_SET_RF_CALIB_REQ, TASK_MM, &param, timeout_ms)?;
     // CFM: mm_set_rf_calib_cfm = 4 x u32 (rxgain_24g_addr, rxgain_5g_addr, txgain_24g_addr, txgain_5g_addr)
-    if rsp.len() >= 16 {
-        let rxgain_24g = u32::from_le_bytes([rsp[0], rsp[1], rsp[2], rsp[3]]);
-        let txgain_24g = u32::from_le_bytes([rsp[8], rsp[9], rsp[10], rsp[11]]);
-        log::info!("[lmac] RF calib OK: rxgain_24g=0x{:08x}, txgain_24g=0x{:08x}", rxgain_24g, txgain_24g);
-    }
+    // if rsp.len() >= 16 {
+    //     let rxgain_24g = u32::from_le_bytes([rsp[0], rsp[1], rsp[2], rsp[3]]);
+    //     let txgain_24g = u32::from_le_bytes([rsp[8], rsp[9], rsp[10], rsp[11]]);
+    //     log::info!("[lmac] RF calib OK: rxgain_24g=0x{:08x}, txgain_24g=0x{:08x}", rxgain_24g, txgain_24g);
+    // }
     Ok(rsp)
 }
 

@@ -9,7 +9,7 @@ use axtask::future::block_on;
 use log;
 
 use crate::bus::{BusState, WifiBus};
-use sdhci_cv1800::{mask_unmask_card_irq_raw, regs::*};
+use sdhci_cv1800::regs::*;
 use aic8800_sdio::SdioHost;
 
 const RX_HWHRD_LEN: usize = 60;  
@@ -343,7 +343,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                         queue.pop_front(); // 丢弃最旧的帧  
                     }  
                     queue.push_back(eth_frame);  
-                    log::info!("[wifi-rx] DATA frame enqueued, queue_len={}", queue.len());
                     drop(queue);  
                     bus.data_rx_pollset.wake();
                 } 
@@ -373,11 +372,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                     // ipc_e2a_msg: [id(2)][dummy_dest(2)][dummy_src(2)][param_len(2)][pattern(4)][param...]  
                     if msg_data.len() >= 8 {  
                         let msg_id = u16::from_le_bytes([msg_data[0], msg_data[1]]);  
-                        let param_len = u16::from_le_bytes([msg_data[6], msg_data[7]]);  
-                        log::info!(  
-                            "[wifi-rx] CFG_CMD_RSP: msg_id=0x{:04x}, param_len={}, total={}",  
-                            msg_id, param_len, msg_data.len()  
-                        );  
   
                         // 判断是 CFM 还是 IND  
                         let expected_cfm = bus.cmd_expected_cfm_id.load(Ordering::Acquire);  
@@ -387,10 +381,6 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                             drop(queue);  
                             bus.cmd_rsp_pollset.wake();  
                         } else {  
-                            log::info!(  
-                                "[wifi-rx] IND routed: msg_id=0x{:04x} (expected=0x{:04x})",  
-                                msg_id, expected_cfm  
-                            );  
                             let mut queue = bus.ind_queue.lock();  
                             queue.push_back(msg_data.to_vec());  
                             drop(queue);  
@@ -399,18 +389,18 @@ fn dispatch_frames(bus: &WifiBus, buf: &[u8]) {
                     }  
                 }  
                 SDIO_TYPE_CFG_DATA_CFM => {  
-                    if msg_data.len() >= 8 {  
-                        let status = u32::from_le_bytes([msg_data[0], msg_data[1], msg_data[2], msg_data[3]]);  
-                        let used_idx = u32::from_le_bytes([msg_data[4], msg_data[5], msg_data[6], msg_data[7]]);  
-                        let tx_done = status & 1;  
-                        let retry_req = (status >> 1) & 1;  
-                        let sw_retry_req = (status >> 2) & 1;  
-                        let acknowledged = (status >> 3) & 1;  
-                        log::info!(  
-                            "[wifi-rx] DATA_CFM: status=0x{:08x} (done={}, retry={}, sw_retry={}, ack={}), used_idx={}",  
-                            status, tx_done, retry_req, sw_retry_req, acknowledged, used_idx  
-                        );  
-                    }  
+                    // if msg_data.len() >= 8 {  
+                    //     let status = u32::from_le_bytes([msg_data[0], msg_data[1], msg_data[2], msg_data[3]]);  
+                    //     let used_idx = u32::from_le_bytes([msg_data[4], msg_data[5], msg_data[6], msg_data[7]]);  
+                    //     let tx_done = status & 1;  
+                    //     let retry_req = (status >> 1) & 1;  
+                    //     let sw_retry_req = (status >> 2) & 1;  
+                    //     let acknowledged = (status >> 3) & 1;  
+                    //     log::info!(  
+                    //         "[wifi-rx] DATA_CFM: status=0x{:08x} (done={}, retry={}, sw_retry={}, ack={}), used_idx={}",  
+                    //         status, tx_done, retry_req, sw_retry_req, acknowledged, used_idx  
+                    //     );  
+                    // }  
                 }  
                 SDIO_TYPE_CFG_PRINT => {  
                     // 固件调试输出  

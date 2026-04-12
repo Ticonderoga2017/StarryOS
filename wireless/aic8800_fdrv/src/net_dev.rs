@@ -64,6 +64,13 @@ impl BaseDriverOps for AicWifiNetDev {
     fn device_name(&self) -> &str {
         "aic8800-wifi" 
     }
+
+    // 返回 SDIO1 CARD_INT 的 PLIC IRQ 号（与 lib.rs 中 axplat::irq::register(38, ...) 一致）  
+    // axnet 的 EthernetDevice::register_waker 会调用 register_irq_waker(38, waker)  
+    // 当 IRQ#38 触发时，irq_hook 会唤醒 axnet poll 循环，使主线程立即处理收到的 DATA 帧  
+    fn irq_num(&self) -> Option<usize> {
+        Some(38)
+    }
 }
 
 impl NetDriverOps for AicWifiNetDev {
@@ -95,7 +102,6 @@ impl NetDriverOps for AicWifiNetDev {
     }
 
     fn transmit(&mut self, tx_buf: NetBufPtr) -> DevResult {
-        log::info!("[wifi-net] transmit() called, frame_len={}", tx_buf.packet_len());
         // Copy the Ethernet frame out of the NetBufPtr buffer.  
         let eth_frame: Vec<u8> = tx_buf.packet().to_vec();
         let buf_ptr = tx_buf.packet().as_ptr() as *mut u8;
@@ -121,10 +127,6 @@ impl NetDriverOps for AicWifiNetDev {
     }
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
-        let queue_len = self.bus.data_rx_queue.lock().len();  
-        if queue_len > 0 {  
-            log::info!("[wifi-net] receive() called, queue_len={}", queue_len);  
-        }
         let frame = self.bus.data_rx_queue.lock().pop_front().ok_or(DevError::Again)?;
         let size = frame.len();
         let ptr = Self::alloc_buf(size).ok_or(DevError::NoMemory)?;
@@ -272,6 +274,13 @@ pub fn run_speed_test(server_ip: &str, server_port: u16, total_bytes: usize, chu
         match socket.send(data, SendOptions::default()) {  
             Ok(n) => {  
                 total_sent += n;  
+                if total_sent % (100 * 1024) < n {  
+                    let pct = total_sent * 100 / total_bytes;  
+                    log::info!(  
+                        "[speed-test] Progress: {}/{} bytes ({}%)",  
+                        total_sent, total_bytes, pct  
+                    );  
+                } 
             }  
             Err(e) => {  
                 send_errors += 1;  
