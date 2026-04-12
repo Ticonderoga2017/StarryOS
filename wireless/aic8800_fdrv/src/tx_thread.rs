@@ -273,15 +273,15 @@ fn tx_process(bus: &WifiBus) -> bool {
         // packet_len [0..2]: payload 长度（不含以太网头、不含 hostdesc） 
         hd[0..2].copy_from_slice(&(payload_len as u16).to_le_bytes());
         // flags_ext [2..4] = 0  
-        // hostid [4..8] = 0（普通数据帧不需要 TX CFM，减少固件→主机流量）  
+        // hostid [4..8]: FIX: 设置 bit 31 请求 TX CFM，用于确认固件是否真正发送了帧  
+        hd[4..8].copy_from_slice(&0x8000_0001u32.to_le_bytes()); 
         // eth_dest_addr [8..14]  
         hd[8..14].copy_from_slice(eth_dest);
         // eth_src_addr [14..20]  
         hd[14..20].copy_from_slice(eth_src);
         // ethertype [20..22]（网络字节序，直接拷贝，与 Linux desc->host.ethertype = eth_t.h_proto 一致） 
         hd[20..22].copy_from_slice(ethertype);
-        // ac [22] = 1 (BE)  
-        hd[22] = 1;  
+        hd[22] = 0;  
         // tid [23] = 0 (BE, 0xFF = non-QoS)  
         hd[23] = 0;  
         // vif_idx [24]
@@ -298,6 +298,12 @@ fn tx_process(bus: &WifiBus) -> bool {
         let sdio = bus.sdio.lock();
         if let Err(e) = sdio.write_fifo(1, SDIOWIFI_WR_FIFO_ADDR, &buf) {
             log::error!("[wifi-tx] DATA write_fifo failed: {:?}", e); 
+        } else {
+            log::info!(  
+                "[wifi-tx] DATA frame sent: dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, len={}, final_len={}",  
+                eth_dest[0], eth_dest[1], eth_dest[2], eth_dest[3], eth_dest[4], eth_dest[5],  
+                payload_len, final_len  
+            );  
         }
         drop(sdio);
 

@@ -592,7 +592,6 @@ impl Wpa2Handshake {
         if has_ack && !has_mic {  
             // M1: ACK=1, MIC=0  
             log::info!("[wpa2] === Processing M1 ===");  
-            log::info!("[wpa2] M1 full ({} bytes): {:02x?}", eapol.len(), eapol);
             self.process_m1(&hdr, eapol)  
         } else if has_ack && has_mic && has_install && has_enc {  
             // M3: ACK=1, MIC=1, Install=1, EncKeyData=1  

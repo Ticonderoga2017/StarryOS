@@ -231,10 +231,6 @@ fn parse_connect_ind(param: &[u8]) -> Result<ConnectResult, CmdError> {
     const IE_BUF_OFFSET: usize = 20;  
     let assoc_req_ies = if param.len() >= IE_BUF_OFFSET + assoc_req_ie_len && assoc_req_ie_len > 0 {  
         let ies = param[IE_BUF_OFFSET..IE_BUF_OFFSET + assoc_req_ie_len].to_vec();  
-        log::info!(  
-            "[wifi_mgr] AssocReq IEs: len={}, data={:02x?}",  
-            ies.len(), &ies[..ies.len().min(64)]  
-        );  
           
         // 搜索 RSN IE (tag=0x30) 并打印  
         let mut offset = 0;  

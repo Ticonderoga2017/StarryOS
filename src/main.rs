@@ -25,16 +25,16 @@ fn main() {
 
     // ===== 网络数据通路测试 =====  
     // 在此期间从 PC 执行: ping 192.168.1.200  
-    #[cfg(feature = "sg2002")]  
-    aic8800_fdrv::net_dev::run_network_poll_loop(0); // 0 = 永久循环  
-    // ===== 网络速度测试 =====  
     // #[cfg(feature = "sg2002")]  
-    // aic8800_fdrv::net_dev::run_speed_test(  
-    //     "192.168.1.15",  // PC 的 IP 地址（根据实际修改）  
-    //     9000,             // PC 监听的端口  
-    //     1_000_000,        // 发送 1MB 数据  
-    //     1024,             // 每次发送 1KB  
-    // );
+    // aic8800_fdrv::net_dev::run_network_poll_loop(0); // 0 = 永久循环  
+    // ===== 网络速度测试 =====  
+    #[cfg(feature = "sg2002")]  
+    aic8800_fdrv::net_dev::run_speed_test(  
+        "192.168.1.15",  // PC 的 IP 地址（根据实际修改）  
+        9000,             // PC 监听的端口  
+        1_000_000,        // 发送 1MB 数据  
+        1024,             // 每次发送 1KB  
+    );
     // 测试完成后注释掉上面这行，恢复正常启动流程  
     // ============================  
 
@@ -145,6 +145,7 @@ fn sdio1_probe() {
 #[cfg(feature = "sg2002")]
 fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {  
     use core::sync::atomic::Ordering;
+    use aic8800_fdrv::lmac_msg::MAC_CIPHER_CCMP;
     // ========== Phase 1: LMAC Configuration ==========  
     info!("========== LMAC Config Start ==========");  
   
@@ -199,6 +200,9 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     // 设置 RX 过滤器：接受单播 + 多播 + 广播帧  
     send_mm_set_filter_req(bus, 0x1502868C, 5000)?;
     info!("[LMAC] rx_filter set: 0x{:08x}", 0x1502868C);
+
+    send_mm_set_idle_req(bus, false, 5000)?;  
+    info!("[LMAC] set_idle(false) OK — interface active");
   
     info!("========== LMAC Config End ==========");  
 
@@ -225,9 +229,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
     );  
   
     let rsn_ie = if !ap.rsn_ie.is_empty() {  
-        info!("[CONNECT] AP RSN IE: {:02x?}", &ap.rsn_ie);  
-        let sta_rsn = build_wpa2_rsn_ie_from_ap(&ap.rsn_ie);  
-        info!("[CONNECT] STA RSN IE: {:02x?}", &sta_rsn);  
+        let sta_rsn = build_wpa2_rsn_ie_from_ap(&ap.rsn_ie); 
         sta_rsn  
     } else if ap.capability & 0x0010 != 0 {  
         // Privacy 位已设置但未捕获到 RSN IE —— 构建默认 WPA2-PSK RSN IE  
@@ -253,11 +255,6 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
         ap.center_freq, &rsn_ie, 15000, 
     )?;  
     info!("[CONNECT] SM_CONNECT_IND: ap_idx={}", connect_result.ap_idx);  
-    info!(  
-        "[DEBUG] assoc_req_ies len={}, data={:02x?}",  
-        connect_result.assoc_req_ies.len(),  
-        &connect_result.assoc_req_ies[..connect_result.assoc_req_ies.len().min(32)]  
-    );
   
     // 从 SM_CONNECT_IND 的 AssocReq IEs 中提取固件实际发送的 RSN IE  
     // 如果固件修改了 RSN IE，必须用修改后的版本进行握手  
@@ -309,7 +306,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
                         true,                       // pairwise: bool  
                         &result.tk,                 // key: &[u8]  
                         0,                          // key_idx: u8  
-                        3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                        MAC_CIPHER_CCMP,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
                         5000,                       // timeout_ms: u64 
                 )?;  
                 info!("[WPA2] PTK installed");  
@@ -322,7 +319,7 @@ fn wifi_main(bus: &Arc<WifiBus>) -> Result<(), CmdError> {
                     false,                      // pairwise: bool  
                     &result.gtk,                // key: &[u8]  
                     result.gtk_key_idx,         // key_idx: u8  
-                    3,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
+                    MAC_CIPHER_CCMP,                          // cipher_suite: u8 (MAC_CIPHER_CCMP)  
                     5000,                       // timeout_ms: u64  
                 )?;  
                 info!("[WPA2] GTK installed");  

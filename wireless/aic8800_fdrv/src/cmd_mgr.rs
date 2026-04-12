@@ -108,8 +108,6 @@ pub fn send_cmd_with_cfm_id(
         return Err(CmdError::BusDown);
     }
 
-    log::info!("[cmd_mgr] state check passed");
-
     let timeout = if timeout_ms == 0 {
         CMD_TX_TIMEOUT_DEFAULT_MS
     } else {
@@ -118,20 +116,6 @@ pub fn send_cmd_with_cfm_id(
 
     // ---- 构造 SDIO 帧 ----
     let frame = build_cmd_frame(msg_id, dest_id, param);
-
-    log::info!(  
-        "[cmd_mgr] SDIO header: [{:02x}, {:02x}, {:02x}, {:02x}], dummy: [{:02x}, {:02x}, {:02x}, {:02x}]",  
-        frame[0], frame[1], frame[2], frame[3],  
-        frame[4], frame[5], frame[6], frame[7],  
-    );
-
-    log::info!("[cmd_mgr] frame built, len={}", frame.len());    
-
-    log::info!(  
-        "[cmd_mgr] TX msg_id=0x{:04x}, dest=0x{:04x}, param_len={}, frame_len={}, timeout={}ms",  
-        msg_id, dest_id, param.len(), frame.len(), timeout  
-    ); 
-
     // 清空残留的 CMD 响应队列（避免旧响应干扰）  
     {
         let mut queue = bus.cmd_rsp_queue.lock();
@@ -780,12 +764,6 @@ fn channel_to_freq(channel: u8) -> u16 {
 ///   [9]     rssi (i8)  
 ///   [10..]  payload — 802.11 管理帧（Beacon/ProbeResp）
 fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
-    log::info!(  
-        "[parse] SCANU_RESULT_IND param_len={}, first_bytes={:02x?}",  
-        param.len(),  
-        &param[..param.len().min(20)]  
-    );  
-
     if param.len() < 12 {
         log::warn!("[parse] SCANU_RESULT_IND too short: {} bytes", param.len()); 
         return None;
@@ -798,12 +776,6 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
     let _sta_idx = param[7];
     let _inst_nbr = param[8];
     let rssi = param[9] as i8;  
-
-    log::info!(  
-        "[parse] length={}, framectrl=0x{:04x}, freq={}, band={}, rssi={}",  
-        length, framectrl, center_freq, band, rssi  
-    ); 
-
     let payload = &param[12..];  
 
     // payload 是 802.11 管理帧（Beacon/ProbeResp）  
@@ -826,11 +798,6 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
 
     let mut bssid = [0u8; 6];  
     bssid.copy_from_slice(&payload[16..22]);  
-
-    log::info!(  
-        "[parse] BSSID={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",  
-        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]  
-    );
   
     let beacon_interval = u16::from_le_bytes([payload[32], payload[33]]);  
     let capability = u16::from_le_bytes([payload[34], payload[35]]);  
@@ -863,10 +830,6 @@ fn parse_scanu_result_ind(param: &[u8]) -> Option<ScanResult> {
             }
             0x30 => {  
                 rsn_ie = ie_data[ie_offset..ie_offset + 2 + ie_len].to_vec();  
-                log::info!(  
-                    "[parse] RSN IE ({} bytes): {:02x?}",  
-                    rsn_ie.len(), &rsn_ie  
-                );  
             }
             _ => {}
         }
@@ -1303,6 +1266,24 @@ pub fn send_mm_set_filter_req(
     Ok(())  
 }
 
+/// 发送 MM_SET_IDLE_REQ  
+/// 对应 Linux: rwnx_send_set_idle (rwnx_msg_tx.c)  
+///  
+/// mm_set_idle_req:  
+///   u8 hw_idle;  [0]   0 = active, 1 = idle  
+///   总计: 1 byte  
+pub fn send_mm_set_idle_req(  
+    bus: &Arc<WifiBus>,  
+    idle: bool,  
+    timeout_ms: u64,  
+) -> Result<Vec<u8>, CmdError> { 
+    let param = [if idle { 1u8 } else { 0u8 }];  
+  
+    log::info!("[cmd_mgr] sending MM_SET_IDLE_REQ: idle={}", idle);  
+  
+    send_cmd(bus, MM_SET_IDLE_REQ, TASK_MM, &param, timeout_ms)
+}
+
 /// MM_GET_MAC_ADDR_REQ / MM_GET_MAC_ADDR_CFM  
 /// 参考 Linux: rwnx_send_get_macaddr_req (rwnx_msg_tx.c:1334-1355)  
 ///  
@@ -1460,14 +1441,6 @@ pub fn send_eapol_data_frame(
     // ---- Ethernet frame [32..] ----  
     let eth_start = SDIO_HEADER_LEN + HOSTDESC_SIZE;  
     buf[eth_start..eth_start + eapol.len()].copy_from_slice(eapol);
-  
-    log::info!(  
-        "[cmd_mgr] EAPOL TX: sdio_hdr={:02x?}, hostdesc={:02x?}, payload_len={}, final_len={}",  
-        &buf[0..4],  
-        &buf[4..32],  
-        eapol.len(),  
-        final_len  
-    );
 
     // 通过 TX 队列发送（复用现有的 tx_thread 路径）  
     // 但 DATA 帧不走 cmd_pending，需要直接写入 SDIO  
